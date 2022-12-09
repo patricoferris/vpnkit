@@ -870,14 +870,16 @@ let command =
      `P "Terminates TCP/IP and UDP/IP connections from a client and proxy the\
          flows via userspace sockets"]
   in
-  Term.(pure main
+  let cmd = Cmd.info (Filename.basename Sys.argv.(0)) ~version:Version.git ~doc ~man in
+  Cmd.v cmd
+  Term.(const main
         $ socket $ port_control_urls $ introspection_urls $ diagnostics_urls $ pcap_urls $ pcap_snaplen
         $ max_connections $ port_forwards $ dns $ http $ http_intercept_api_path $ hosts
         $ host_names $ gateway_names $ vm_names $ listen_backlog $ port_max_idle_time $ debug
         $ server_macaddr $ domain $ allowed_bind_addresses $ gateway_ip $ host_ip
         $ lowest_ip $ highest_ip $ dhcp_json_path $ mtu $ udpv4_forwards $ tcpv4_forwards
-        $ gateway_forwards_path $ forwards_path $ gc_compact),
-  Term.info (Filename.basename Sys.argv.(0)) ~version:Version.git ~doc ~man
+        $ gateway_forwards_path $ forwards_path $ gc_compact)
+  
 
 let () =
   Printexc.record_backtrace true;
@@ -886,4 +888,4 @@ let () =
   Log.err (fun f ->
       f "Lwt.async failure %a: %s" Fmt.exn exn (Printexc.get_backtrace ()))
   );
-  Term.exit @@ Term.eval command
+  exit @@ Cmd.eval command

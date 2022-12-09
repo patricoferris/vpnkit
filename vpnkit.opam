@@ -22,12 +22,15 @@ build: [
 ]
 
 depends: [
-  "ocaml" {>="4.08.0"}
+  "ocaml" {>= "5.0.0" }
+  "ocaml-base-compiler" {= "5.0.0~rc1"}
+  # "ocaml-variants" {= "5.0.0~rc1"}
   "dune"
   "alcotest" {with-test}
-  "ounit" {with-test}
+  "ounit2" {with-test}
   "tar" {>= "1.0.1"}
   "ipaddr" {>= "5.0.1"}
+  "eio" {>= "0.6"}
   "lwt" {>= "5.4.0"}
   "luv"
   "luv_unix"
@@ -35,7 +38,7 @@ depends: [
   "base64" {>= "3.5.0"}
   "cstruct" {>= "6.0.0"}
   "pcap-format" {>= "0.4.0"}
-  "cmdliner" {< "1.1.0"}
+  "cmdliner" {>= "1.1.0"}
   "charrua" {>= "1.3.0"}
   "charrua-client"
   "charrua-server"
@@ -55,7 +58,7 @@ depends: [
   "cohttp-lwt" {>= "0.99.0"}
   "protocol-9p" {>= "2.0.0"}
   "mirage-vnetif" {>= "0.5.0"}
-  "io-page-unix"
+  "io-page"       {>= "3.0.0"}
   "uuidm"
   "ezjsonm" {>= "0.4.0"}
   "sha" {with-test}
@@ -72,6 +75,11 @@ pin-depends:[
   # Luv doesn't like to be vendored and dune doesn't have the feature to fix it... :/
   [ "luv.dev" "git+https://github.com/patricoferris/luv#9726db8b18c6c50805dea80a0751589cfa5ad8da" ]
   [ "luv_unix.dev" "git+https://github.com/patricoferris/luv#9726db8b18c6c50805dea80a0751589cfa5ad8da" ]
+  # Upgrades cmdliner and also sexplib
+  [ "protocol-9p.dev" "git+https://github.com/patricoferris/ocaml-9p#22fa2d59f2695da627e4531185d626dabe2bfba1" ]
+  # OCaml 5 fixes
+  [ "fd-send-recv.dev" "git+https://github.com/xapi-project/ocaml-fd-send-recv#1c47d34726f30c2068b783a20c16da3ac707ea73" ]
+  [ "hvsock.dev" "git+https://github.com/mirage/ocaml-hvsock#6b90ba4ab43257e05e377672f4e07b2d1b643588"]
 ]
 synopsis: "VPN-friendly networking devices for HyperKit"
 description: """
