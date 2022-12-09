@@ -11,3 +11,4 @@ vpnkit.tgz
 opam/licenses/dependency.slirp
 src/hostnet_test/_tests/
 .merlin
+duniverse

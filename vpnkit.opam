@@ -67,9 +67,28 @@ depends: [
   "re" {>= "1.9.0"}
   "ppx_inline_test"
 ]
+# HACK
+pin-depends:[
+  # Luv doesn't like to be vendored and dune doesn't have the feature to fix it... :/
+  [ "luv.dev" "git+https://github.com/patricoferris/luv#9726db8b18c6c50805dea80a0751589cfa5ad8da" ]
+  [ "luv_unix.dev" "git+https://github.com/patricoferris/luv#9726db8b18c6c50805dea80a0751589cfa5ad8da" ]
+]
 synopsis: "VPN-friendly networking devices for HyperKit"
 description: """
 HyperKit is a hypervisor which runs on macOS using the "hypervisor.framework".
 VPNKit implements a virtual ethernet device for HyperKit VMs in a VPN-friendly
 way, by terminating and proxying all the TCP flows, caching and forwarding
 DNS requests etc. HyperKit and VPNKit are used in Docker for Mac and Windows."""
+x-opam-monorepo-opam-repositories: [
+   "file://$OPAM_MONOREPO_CWD/repos/dune-universe"
+   "file://$OPAM_MONOREPO_CWD/repos/alpha"
+   "file://$OPAM_MONOREPO_CWD/repos/opam-repository"
+ ]
+# Could include these for additional reproducibility but less portability.
+# x-opam-monorepo-global-opam-vars: [
+#   [ "arch" "x86_64" ]
+#   [ "os" "linux" ]
+#   [ "os-distribution" "debian" ]
+#   [ "os-family" "debian" ]
+#   [ "os-version" "11" ]
+# ]
