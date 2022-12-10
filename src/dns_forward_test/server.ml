@@ -33,9 +33,7 @@ module Make(Server: Rpc.Server.S) = struct
 
   let answer buffer t =
     t.nr_queries <- t.nr_queries + 1;
-    let open Lwt.Infix in
-    Lwt_unix.sleep t.delay
-    >>= fun () ->
+    Eio_unix.sleep t.delay;
     let len = Cstruct.length buffer in
     let buf = buffer in
     match Dns.Protocol.Server.parse (Cstruct.sub buf 0 len) with
@@ -60,7 +58,7 @@ module Make(Server: Rpc.Server.S) = struct
                 | false -> request.questions in
                 let pkt = { Dns.Packet.id; detail; questions; authorities=[]; additionals; answers } in
                 let buf = Dns.Packet.marshal pkt in
-                Lwt.return (Ok buf)
+                Ok buf
             | Some v4 ->
                 let answers = [ { name = q_name; cls = RR_IN; flush = false; ttl = 0l; rdata = A v4 } ] in
                 let detail = { detail with Dns.Packet.qr = Dns.Packet.Response } in
@@ -69,23 +67,24 @@ module Make(Server: Rpc.Server.S) = struct
                 | false -> request.questions in
                 let pkt = { Dns.Packet.id; detail; questions; authorities=[]; additionals; answers } in
                 let buf = Dns.Packet.marshal pkt in
-                Lwt.return (Ok buf)
+                Ok buf
             end
         | _ ->
-            Lwt.return (Error (`Msg "unexpected query type"))
+          Error (`Msg "unexpected query type")
         end
     | None ->
-        Lwt.return (Error (`Msg "failed to parse request"))
+        Error (`Msg "failed to parse request")
 
   type server = Server.server
 
-  let serve ~address t =
+  let serve ~sw ~address net t =
     let open Error in
-    Server.bind address
+    Server.bind ~sw net address
     >>= fun server ->
-    Server.listen server (fun buf -> answer buf t)
+    Logs.debug (fun f -> f "Successful bind");
+    Server.listen ~sw server (fun buf -> answer buf t)
     >>= fun () ->
-    Lwt.return (Ok server)
+    Ok server
 
   let shutdown = Server.shutdown
 

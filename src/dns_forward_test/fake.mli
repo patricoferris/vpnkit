@@ -18,14 +18,17 @@
 (** A fake Time and Clock module for testing the timing without having to actually
     wait. *)
 
-module Time: Mirage_time.S
+module Clock : sig
+    type t = <
+        Eio.Time.clock;
+        advance : float -> unit;
+        reset : unit;
+    >
+    
+    val make : unit -> t
+    (** [make ()] is a new clock. *)
 
-module Clock: Mirage_clock.MCLOCK
+    val advance : t -> float -> unit
 
-val advance: int64 -> unit
-(** [advance nsecs]: advances the clock by [nsecs]. Note this will make sleeping
-    threads runnable but it will not wait for them to finish or even to run.
-    External synchronisation still needs to be used. *)
-
-val reset: unit -> unit
-(** [reset ()] sets the clock back to the initial value for another test. *)
+    val reset : t -> unit
+end

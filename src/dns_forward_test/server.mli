@@ -29,10 +29,10 @@ module Make(Server: Rpc.Server.S): sig
   type server
   (** A running server *)
 
-  val serve: address: Config.Address.t -> t -> server Error.t
+  val serve: sw:Eio.Switch.t -> address: Config.Address.t -> Eio.Net.t -> t -> server Error.t
   (** Serve requests on the given IP and port forever *)
 
-  val shutdown: server -> unit Lwt.t
+  val shutdown: server -> unit
   (** Shutdown the running server *)
 
   val get_nr_queries: t -> int

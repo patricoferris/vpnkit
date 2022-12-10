@@ -1,3 +1,0 @@
-(library
- (name dns_forward_lwt_unix)
- (libraries eio dns_forward unix io-page mirage-clock-unix))

@@ -43,11 +43,13 @@ module Tcp (Flow : Mirage_flow.S) = struct
   let close t = Flow.close @@ C.to_flow t.c
 
   let read t =
-    Eio.Mutex.use_ro t.read_m (fun () ->
+    Eio.Mutex.use_rw ~protect:false t.read_m (fun () ->
+       Logs.debug (fun f -> f "Reading!");
         match C.read_exactly ~len:2 t.c with
         | Error e -> errorf "Failed to read response header: %a" C.pp_error e
         | Ok `Eof -> errorf "Got EOF while reading the response header"
         | Ok (`Data bufs) -> (
+            Logs.debug (fun f -> f "HERE");
             let buf = Cstruct.concat bufs in
             let len = Cstruct.BE.get_uint16 buf 0 in
             match C.read_exactly ~len t.c with
@@ -58,7 +60,8 @@ module Tcp (Flow : Mirage_flow.S) = struct
             | Ok (`Data bufs) -> Ok (Cstruct.concat bufs)))
 
   let write t buffer =
-    Eio.Mutex.use_ro t.write_m (fun () ->
+    Logs.debug (fun f -> f "WR");
+    Eio.Mutex.use_rw ~protect:false t.write_m (fun () ->
         (* RFC 1035 4.2.2 TCP Usage: 2 byte length field *)
         let header = Cstruct.create 2 in
         Cstruct.BE.set_uint16 header 0 (Cstruct.length buffer);

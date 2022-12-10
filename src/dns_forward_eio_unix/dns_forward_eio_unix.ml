@@ -316,7 +316,7 @@ module Udp = struct
   let string_of_server t =
     Printf.sprintf "listen udp:%s" (string_of_address t.address)
 
-  let getsockname _server = Obj.magic "TODO"
+  let getsockname _server = raise (Failure "TODO")
   (* getsockname "Udp.getsockname" server.server_fd *)
 
   let bind ~sw net address =

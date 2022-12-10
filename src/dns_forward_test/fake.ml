@@ -17,33 +17,42 @@
 
 (* A fake Time and Clock module for testing the timing without having to actually
    wait. *)
-
-let timeofday = ref 0L
-let c = Lwt_condition.create ()
-
-let advance nsecs =
-  timeofday := Int64.add !timeofday nsecs;
-  Lwt_condition.broadcast c ()
-
-let reset () =
-  timeofday := 0L;
-  Lwt_condition.broadcast c ()
-
-module Time = struct
-  let sleep_ns n =
-    let open Lwt.Infix in
-    (* All sleeping is relative to the start of the program for now *)
-    let now = 0L in
-    let rec loop () =
-      if !timeofday > Int64.add now n then Lwt.return_unit else (
-        Lwt_condition.wait c >>= fun () ->
-        loop ()
-      ) in
-    loop ()
-
-end
+open Eio
 
 module Clock = struct
-  let elapsed_ns () = !timeofday
-  let period_ns () = None
+
+  type t = <
+        Eio.Time.clock;
+        advance : float -> unit;
+        reset : unit;
+    >
+
+  let make () =
+    object (_self)
+      inherit Eio.Time.clock
+
+      val mutable now = 0.0
+      val c = Eio.Condition.create ()
+
+      method now = now
+
+      method reset = now <- 0.0; Condition.broadcast c 
+
+      method advance secs = 
+        now <- now +. secs;
+        Condition.broadcast c
+
+      method sleep_until time =
+          (* All sleeping is relative to the start of the program for now *)
+          let v = 0. in
+          let rec loop () =
+            if Float.compare now (v +. time) > 0 then () else (
+              Condition.await_no_mutex c;
+              loop ()
+            ) in
+          loop ()
+    end
+
+  let advance t n = t#advance n
+  let reset t = t#reset
 end

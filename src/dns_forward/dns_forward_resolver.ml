@@ -24,12 +24,14 @@ module Log = (val Logs.src_log src : Logs.LOG)
 open Eio
 
 let nchoose_split list =
-  List.fold_left
+  let ready, waiting = List.fold_left
     (fun (term, acc) p ->
       match Promise.peek p with
       | Some _ -> (Promise.await_exn p :: term, acc)
       | None -> (term, p :: acc))
     ([], []) list
+  in
+    List.rev ready, List.rev waiting
 
 let is_in_domain name domain =
   let name' = List.length name and domain' = List.length domain in
@@ -242,6 +244,7 @@ module Make (Client : Dns_forward_s.RPC_CLIENT) = struct
                         c.online <- false);
                       Error x
                   | Ok reply -> (
+                    Logs.debug (fun f -> f "Got a reply!");
                       c.reply_expected_since <- None;
                       c.replies_missing <- 0;
                       if not c.online then (
@@ -273,7 +276,7 @@ module Make (Client : Dns_forward_s.RPC_CLIENT) = struct
                  (if configured).
                - Group the servers into lists of equal priorities.
                - Send all the requests concurrently. *)
-            let many_rpcs ~sw connections =
+            let many_rpcs connections =
               let equal_priority_groups =
                 choose_servers
                   (List.map (fun c -> c.server) connections)
@@ -302,18 +305,18 @@ module Make (Client : Dns_forward_s.RPC_CLIENT) = struct
                           (fun c ->
                             Address.to_string @@ c.server.Server.address)
                           offline))));
-            Switch.run @@ fun sw ->
             (* For all the offline servers, send the requests as a "ping" to see
                if they are alive or not. Any response will flip them back to online
                but we won't consider their responses until the next RPC *)
-            let _ = many_rpcs ~sw offline in
+            let _ = many_rpcs offline in
 
             (* For all the online servers, send the requests and return the waiting
                threads. *)
-            let online_results = many_rpcs ~sw online in
+            let online_results = many_rpcs online in
 
             (* Wait for the best result from a set of equal priority requests *)
             let rec wait best_so_far remaining =
+              Logs.debug (fun f -> f "Waiting %i" (List.length remaining));
               if remaining = [] then best_so_far
               else
                 let terminated, remaining = nchoose_split remaining in
@@ -347,7 +350,9 @@ module Make (Client : Dns_forward_s.RPC_CLIENT) = struct
                     best_so_far terminated
                 with
                 | Ok (`Success result) -> Ok (`Success result)
-                | best_so_far -> wait best_so_far remaining
+                | best_so_far ->
+                  Eio.Fiber.yield ();
+                  wait best_so_far remaining
             in
             (* Wait for each equal priority group at a time *)
             let res =

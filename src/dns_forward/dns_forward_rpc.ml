@@ -96,6 +96,7 @@ module Client = struct
                            therefore if we fail to write the request, reconnect and try once more. *)
                         Packet.write rw buffer >>= fun () ->
                         Packet.read rw >>= fun buf ->
+                        Logs.debug (fun f -> f "READ");
                         t.message_cb ~src:t.address ~buf ();
                         (* Rewrite the query id back to the original *)
                         Cstruct.BE.set_uint16 buf 0 client_id;
@@ -128,7 +129,7 @@ module Client = struct
         address : address;
         mutable client_address : address;
         mutable rw : Packet.t option;
-        mutable disconnect_on_idle : unit;
+        mutable disconnect_on_idle : unit Eio.Promise.or_exn;
         wakeners :
           ( int,
             Dns.Packet.question * (Cstruct.t, exn) result Eio.Promise.u )
@@ -173,12 +174,18 @@ module Client = struct
          is closed, `read_buffer` will fail and this thread will exit. *)
       let dispatcher t rw () =
         let rec loop () =
+          Logs.debug (fun f -> f "Looping in the dispatcher");
           match Packet.read rw with
           | Error (`Msg m) ->
               Log.debug (fun f ->
                   f "%s: dispatcher shutting down: %s" (to_string t) m);
               disconnect t
+          | exception e ->
+            Log.debug (fun f ->
+                f "%s: dispatcher shutting down: %s" (to_string t) (Printexc.to_string e));
+            disconnect t
           | Ok buffer -> (
+              Logs.debug (fun f -> f "Got buffer");
               let buf = buffer in
               match
                 Dns.Protocol.Server.parse
@@ -207,10 +214,11 @@ module Client = struct
                               "%s %04x: response arrived for DNS request just \
                                after disconnection"
                               (to_string t) client_id)
-                  else
+                  else begin
                     Log.debug (fun f ->
                         f "%s %04x: no wakener: it was probably cancelled"
-                          (to_string t) client_id);
+                          (to_string t) client_id)
+                  end;
                   loop ()
               | _ ->
                   Log.err (fun f ->
@@ -220,7 +228,7 @@ module Client = struct
         try loop ()
         with e ->
           Log.info (fun f ->
-              f "%s dispatcher caught %s" (to_string t) (Printexc.to_string e))
+              f "%s dispatcher caught %s \n%s" (to_string t) (Printexc.to_string e) (Printexc.get_backtrace ()))
 
       let get_rw ~sw clock net t =
         (* Lwt.cancel t.disconnect_on_idle; *)
@@ -228,6 +236,7 @@ module Client = struct
           Mutex.use_ro t.m (fun () ->
               match t.rw with
               | None ->
+                  Logs.debug (fun f -> f "Trying to connect");
                   Sockets.connect ~sw ~net
                     ( t.address.Dns_forward_config.Address.ip,
                       t.address.Dns_forward_config.Address.port )
@@ -235,20 +244,20 @@ module Client = struct
                   let rw = Packet.connect flow in
                   t.rw <- Some rw;
                   Fiber.fork ~sw (dispatcher t rw);
+                  Logs.debug (fun f -> f "Trying to connected");
                   Ok rw
               | Some rw -> Ok rw)
         in
         (* Add a fresh idle timer *)
-        t.disconnect_on_idle <-
-          (Time.sleep clock 30.;
-           disconnect t);
+        t.disconnect_on_idle <- (Fiber.fork_promise ~sw (fun () -> Time.sleep clock 30.; disconnect t));
+        Logs.debug (fun f -> f "Returning");
         rw
 
       let connect ~gen_transaction_id
           ?(message_cb = fun ?src:_ ?dst:_ ~buf:_ () -> ()) address =
         let rw = None in
         let m = Mutex.create () in
-        let disconnect_on_idle = () in
+        let disconnect_on_idle = Promise.create_resolved (Ok ()) in
         let wakeners = Hashtbl.create 7 in
         let free_ids = Dns_forward_free_id.make ~g:gen_transaction_id () in
         let client_address =
@@ -305,6 +314,7 @@ module Client = struct
                     (* If we fail to connect, return the error *)
                     let v =
                       get_rw ~sw clock net t >>= fun rw ->
+                      Logs.debug (fun f -> f "RAWFEWDFW");
                       t.message_cb ~dst:t.address ~buf:buffer ();
                       (* An existing connection to the server might have been closed by the server;
                          therefore if we fail to write the request, reconnect and try once more. *)
