@@ -1,0 +1,4 @@
+(library
+  (name        dns_eio)
+  (libraries   dns eio mirage-profile)
+  (wrapped     false))

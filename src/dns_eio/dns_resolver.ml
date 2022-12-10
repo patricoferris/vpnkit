@@ -16,7 +16,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *)
 
-open Lwt.Infix
+open Eio
 open Dns
 open Operators
 open Protocol
@@ -26,58 +26,66 @@ module DP = Packet
 type result = Answer of DP.t | Error of exn
 
 type commfn = {
-  txfn    : Cstruct.t -> unit Lwt.t;
-  rxfn    : (Cstruct.t -> Dns.Packet.t option) -> DP.t Lwt.t;
-  timerfn : unit -> unit Lwt.t;
-  cleanfn : unit -> unit Lwt.t;
+  txfn    : Cstruct.t -> unit;
+  rxfn    : (Cstruct.t -> Dns.Packet.t option) -> DP.t;
+  timerfn : unit -> unit;
+  cleanfn : unit -> unit;
 }
 
 let rec send_req txfn timerfn q =
   function
-  | 0 -> Lwt.return_unit
+  | 0 -> ()
   | count ->
-    txfn q >>= fun () ->
-    timerfn () >>= fun () ->
+    txfn q;
+    timerfn ();
     send_req txfn timerfn q (count - 1)
 
+let nchoose_split list =
+  let ready, waiting = List.fold_left
+    (fun (term, acc) p ->
+      match Promise.peek p with
+      | Some _ -> (Promise.await p :: term, acc)
+      | None -> (term, p :: acc))
+    ([], []) list
+  in
+    List.rev ready, List.rev waiting
+
 let send_pkt client ?alloc ({ txfn; rxfn; timerfn; _ }) pkt =
+  Eio.Switch.run @@ fun sw ->
   let module R = (val client : CLIENT) in
   let cqpl = R.marshal ?alloc pkt in
   let resl = List.map (fun (ctxt,q) ->
     (* make a new socket for each request flavor *)
     (* start the requests in parallel and run them until success or timeout*)
-    let t, w = Lwt.wait () in
-    Lwt.async (fun () -> Lwt.pick [
-      (send_req txfn timerfn q 4 >|= fun () -> Error (R.timeout ctxt));
-      (Lwt.catch
-         (fun () -> rxfn (R.parse ctxt) >|= fun r -> Answer r)
-         (fun exn -> Lwt.return (Error exn))
-      )
-    ] >|= Lwt.wakeup w);
+    let t, w = Promise.create () in
+    Fiber.fork ~sw (fun () -> Fiber.any [
+      (fun () -> send_req txfn timerfn q 4; Error (R.timeout ctxt));
+      (fun () ->
+        try rxfn (R.parse ctxt) |> fun r -> Answer r with exn -> Error exn)
+    ] |> fun v -> Promise.resolve w v);
     t
   ) cqpl in
   (* return an answer or all the errors if no request succeeded *)
   let rec select errors = function
-    | [] -> Lwt.fail (Dns_resolve_error errors)
+    | [] -> raise (Dns_resolve_error errors)
     | ts ->
-      Lwt.nchoose_split ts
-      >>= fun (rs, ts) ->
+      let rs, ts = nchoose_split ts in
       let rec find_answer errors = function
         | [] -> select errors ts
-        | (Answer a)::_ -> Lwt.return a
-        | (Error e)::r -> find_answer (e::errors) r
+        | (Answer a) :: _ -> a
+        | (Error e) :: r -> find_answer (e::errors) r
       in
       find_answer errors rs
   in select [] resl
 
 let resolve_pkt client ?alloc (commfn:commfn) pkt =
-  Lwt.catch (fun () ->
-      send_pkt client ?alloc commfn pkt
-      >>= fun r -> commfn.cleanfn ()
-      >>= fun () -> Lwt.return r)
-    (function exn ->
-      commfn.cleanfn () >>= fun () ->
-      Lwt.fail exn)
+  try
+      let r = send_pkt client ?alloc commfn pkt in
+      commfn.cleanfn ();
+      r
+  with exn ->
+      commfn.cleanfn ();
+      raise exn
 
 let resolve client
     ?alloc
@@ -96,8 +104,7 @@ let gethostbyname
     name =
   let open DP in
   let domain = Name.of_string name in
-  resolve (module Dns.Protocol.Client) ?alloc commfn q_class q_type domain
-  >|= fun r ->
+  let r = resolve (module Dns.Protocol.Client) ?alloc commfn q_class q_type domain in
   List.fold_left (fun a x ->
       match x.rdata with
       | A ip -> Ipaddr.V4 ip :: a
@@ -114,8 +121,7 @@ let gethostbyaddr
   =
   let addr = Name.of_ipaddr (Ipaddr.V4 addr) in
   let open DP in
-  resolve (module Dns.Protocol.Client) ?alloc commfn q_class q_type addr
-  >|= fun r ->
+  let r = resolve (module Dns.Protocol.Client) ?alloc commfn q_class q_type addr in
   List.fold_left (fun a x ->
       match x.rdata with |PTR n -> (Name.to_string n)::a |_->a
     ) [] r.answers

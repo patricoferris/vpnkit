@@ -17,17 +17,17 @@
  *)
 
 type commfn = {
-  txfn    : Cstruct.t -> unit Lwt.t;
+  txfn    : Cstruct.t -> unit;
   (** [txfn buf] resolves when [buf] has been transmitted. *)
 
-  rxfn    : (Cstruct.t -> Dns.Packet.t option) -> Dns.Packet.t Lwt.t;
+  rxfn    : (Cstruct.t -> Dns.Packet.t option) -> Dns.Packet.t;
   (** [rxfn parse] resolves to a packet processed by [parse] after it
       has been received. *)
 
-  timerfn : unit -> unit Lwt.t;
+  timerfn : unit -> unit;
   (** [timerfn ()] resolves when a request should be timed out. *)
 
-  cleanfn : unit -> unit Lwt.t;
+  cleanfn : unit -> unit;
   (** [cleanfn ()] resolves after any resources used by the rest of
       the {!commfn} have been released. *)
 }
@@ -39,7 +39,7 @@ val resolve_pkt :
   (module Dns.Protocol.CLIENT) ->
   ?alloc:(unit -> Cstruct.t) ->
   commfn -> Dns.Packet.t ->
-  Dns.Packet.t Lwt.t
+  Dns.Packet.t
 (** [resolve_pkt client ?alloc commfn packet] will attempt resolution
     of the query contained in [packet] via the protocol client
     [client] and using the utilities of [commfn]. [alloc] may be
@@ -59,7 +59,7 @@ val resolve :
   commfn -> Dns.Packet.q_class -> 
   Dns.Packet.q_type -> 
   Dns.Name.t ->
-  Dns.Packet.t Lwt.t
+  Dns.Packet.t
 (** [resolve client ?alloc ?dnssec commfn q_class q_type name] will
     construct a query packet from [dnssec], [q_class], [q_type], and
     [name] and then attempt to resolve it by calling {!resolve_pkt}. *)
@@ -68,10 +68,10 @@ val gethostbyname :
   ?alloc:(unit -> Cstruct.t) ->
   ?q_class:Dns.Packet.q_class ->
   ?q_type:Dns.Packet.q_type -> commfn ->
-  string -> Ipaddr.t list Lwt.t
+  string -> Ipaddr.t list
 
 val gethostbyaddr :
   ?alloc:(unit -> Cstruct.t) ->
   ?q_class:Dns.Packet.q_class ->
   ?q_type:Dns.Packet.q_type -> commfn ->
-  Ipaddr.V4.t -> string list Lwt.t
+  Ipaddr.V4.t -> string list
