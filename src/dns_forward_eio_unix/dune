@@ -1,0 +1,3 @@
+(library
+ (name dns_forward_eio_unix)
+ (libraries eio eio.unix dns_forward unix io-page mirage-clock-unix))

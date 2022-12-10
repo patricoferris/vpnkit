@@ -14,17 +14,19 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  *)
-open Lwt.Infix
 
-type 'a t = ('a, [ `Msg of string ]) Lwt_result.t
+type 'a t = ('a, [ `Msg of string ]) result
 
-let errorf fmt = Fmt.kstr (fun s -> Lwt.return (Error (`Msg s))) fmt
+let errorf fmt = Fmt.kstr (fun s -> Error (`Msg s)) fmt
 
-module FromFlowError(Flow: Mirage_flow.S) = struct
-  let (>>=) m f = m >>= function
-    | `Eof     -> errorf "Unexpected end of file"
-    | `Error e -> errorf "%a" Flow.pp_error e
-    | `Ok x    -> f x
+module Infix = struct
+  let ( >>= ) = Result.bind
 end
 
-module Infix = Lwt_result.Infix
+module FromFlowError (Flow : Mirage_flow.S) = struct
+  let ( >>= ) m f =
+    match m with
+    | `Eof -> errorf "Unexpected end of file"
+    | `Error e -> errorf "%a" Flow.pp_error e
+    | `Ok x -> f x
+end

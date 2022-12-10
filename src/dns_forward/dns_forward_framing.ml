@@ -15,8 +15,6 @@
  *
  *)
 
-open Lwt.Infix
-
 let src =
   let src = Logs.Src.create "Dns_forward" ~doc:"DNS framing" in
   Logs.Src.set_level src (Some Logs.Debug);
@@ -26,61 +24,56 @@ module Log = (val Logs.src_log src : Logs.LOG)
 
 module type S = Dns_forward_s.READERWRITER
 
-module Tcp (Flow: Mirage_flow.S) = struct
+module Tcp (Flow : Mirage_flow.S) = struct
   let errorf = Dns_forward_error.errorf
 
-  module C = Mirage_channel.Make(Flow)
+  module C = Mirage_channel.Make (Flow)
 
   type request = Cstruct.t
   type response = Cstruct.t
   type flow = Flow.flow
-  type t = {
-    c: C.t;
-    write_m: Lwt_mutex.t;
-    read_m: Lwt_mutex.t;
-  }
+  type t = { c : C.t; write_m : Eio.Mutex.t; read_m : Eio.Mutex.t }
 
   let connect flow =
     let c = C.create flow in
-    let write_m = Lwt_mutex.create () in
-    let read_m = Lwt_mutex.create () in
+    let write_m = Eio.Mutex.create () in
+    let read_m = Eio.Mutex.create () in
     { c; write_m; read_m }
 
-  let close t =
-    Flow.close @@ C.to_flow t.c
+  let close t = Flow.close @@ C.to_flow t.c
 
   let read t =
-    Lwt_mutex.with_lock t.read_m (fun () ->
-        C.read_exactly ~len:2 t.c >>= function
+    Eio.Mutex.use_ro t.read_m (fun () ->
+        match C.read_exactly ~len:2 t.c with
         | Error e -> errorf "Failed to read response header: %a" C.pp_error e
         | Ok `Eof -> errorf "Got EOF while reading the response header"
-        | Ok (`Data bufs) ->
+        | Ok (`Data bufs) -> (
             let buf = Cstruct.concat bufs in
             let len = Cstruct.BE.get_uint16 buf 0 in
-            C.read_exactly ~len t.c >>= function
-            | Error e -> errorf "Failed to read response payload (%d bytes): \
-                                 %a" len C.pp_error e
+            match C.read_exactly ~len t.c with
+            | Error e ->
+                errorf "Failed to read response payload (%d bytes): %a" len
+                  C.pp_error e
             | Ok `Eof -> errorf "Got EOF while reading the response payload"
-            | Ok (`Data bufs) -> Lwt_result.return (Cstruct.concat bufs)
-      )
+            | Ok (`Data bufs) -> Ok (Cstruct.concat bufs)))
 
   let write t buffer =
-    Lwt_mutex.with_lock t.write_m (fun () ->
+    Eio.Mutex.use_ro t.write_m (fun () ->
         (* RFC 1035 4.2.2 TCP Usage: 2 byte length field *)
         let header = Cstruct.create 2 in
         Cstruct.BE.set_uint16 header 0 (Cstruct.length buffer);
         C.write_buffer t.c header;
         C.write_buffer t.c buffer;
-        C.flush t.c >>= function
-        | Ok ()   -> Lwt_result.return ()
+        C.flush t.c |> function
+        | Ok () -> Ok ()
         | Error e ->
             errorf "Failed to write %d bytes: %a" (Cstruct.length buffer)
-              C.pp_write_error e
-      )
+              C.pp_write_error e)
 end
 
-module Udp (Flow: Mirage_flow.S) = struct
+module Udp (Flow : Mirage_flow.S) = struct
   module Error = Dns_forward_error.Infix
+
   let errorf = Dns_forward_error.errorf
 
   type request = Cstruct.t
@@ -92,13 +85,13 @@ module Udp (Flow: Mirage_flow.S) = struct
   let close t = Flow.close t
 
   let read t =
-    Flow.read t >>= function
-    | Ok (`Data buf) -> Lwt_result.return buf
-    | Ok `Eof        -> errorf "read: Eof"
-    | Error e        -> errorf "read: %a" Flow.pp_error e
+    match Flow.read t with
+    | Ok (`Data buf) -> Ok buf
+    | Ok `Eof -> errorf "read: Eof"
+    | Error e -> errorf "read: %a" Flow.pp_error e
 
   let write t buf =
-    Flow.write t buf >>= function
-    | Ok () -> Lwt_result.return ()
+    match Flow.write t buf with
+    | Ok () -> Ok ()
     | Error e -> errorf "write: %a" Flow.pp_write_error e
 end

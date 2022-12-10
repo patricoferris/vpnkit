@@ -15,12 +15,20 @@
  *
  *)
 
-module type S = Dns_forward_s.READERWRITER
+(** DNS utilities over Lwt_unix *)
 
-module Tcp (Flow : Mirage_flow.S) : sig
-  include Dns_forward_s.READERWRITER with type flow = Flow.flow
+module Resolver : sig
+  module Udp : Dns_forward.Resolver.S
+  (** A DNS resolver over UDP *)
+
+  module Tcp : Dns_forward.Resolver.S
+  (** A DNS resolver over TCP *)
 end
 
-module Udp (Flow : Mirage_flow.S) : sig
-  include Dns_forward_s.READERWRITER with type flow = Flow.flow
+module Server : sig
+  module Udp : Dns_forward.Server.S with type resolver = Resolver.Udp.t
+  (** A forwarding DNS proxy over UDP *)
+
+  module Tcp : Dns_forward.Server.S with type resolver = Resolver.Tcp.t
+  (** A forwarding DNS proxy over TCP *)
 end

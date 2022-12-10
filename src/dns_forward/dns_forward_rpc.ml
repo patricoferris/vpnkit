@@ -20,358 +20,366 @@ let src =
   Logs.Src.set_level src (Some Logs.Info);
   src
 
+let ( >>= ) = Result.bind
+
 module Log = (val Logs.src_log src : Logs.LOG)
 
 module Client = struct
-
   module type S = Dns_forward_s.RPC_CLIENT
 
   module Nonpersistent = struct
     module Make
-      (Sockets: Dns_forward_s.FLOW_CLIENT with type address = Ipaddr.t * int)
-      (Packet: Dns_forward_s.READERWRITER with type flow = Sockets.flow)
-      (Time: Mirage_time.S) = struct
-        type address = Dns_forward_config.Address.t
-        type request = Cstruct.t
-        type response = Cstruct.t
+        (Sockets : Dns_forward_s.FLOW_CLIENT with type address = Ipaddr.t * int)
+        (Packet : Dns_forward_s.READERWRITER with type flow = Sockets.flow) =
+    struct
+      type address = Dns_forward_config.Address.t
+      type request = Cstruct.t
+      type response = Cstruct.t
 
-        type message_cb = ?src:address -> ?dst:address -> buf:Cstruct.t -> unit -> unit Lwt.t
+      type message_cb =
+        ?src:address -> ?dst:address -> buf:Cstruct.t -> unit -> unit
 
-        type t = {
-          address: address;
-          free_ids: Dns_forward_free_id.t;
-          message_cb: message_cb;
-        }
+      type t = {
+        address : address;
+        free_ids : Dns_forward_free_id.t;
+        message_cb : message_cb;
+      }
 
-        let connect
-          ~gen_transaction_id
-          ?(message_cb = fun ?src:_ ?dst:_ ~buf:_ () -> Lwt.return_unit)
-          address =
-          let free_ids = Dns_forward_free_id.make ~g:gen_transaction_id () in
-          Lwt_result.return { address; free_ids; message_cb }
+      let connect ~gen_transaction_id
+          ?(message_cb = fun ?src:_ ?dst:_ ~buf:_ () -> ()) address =
+        let free_ids = Dns_forward_free_id.make ~g:gen_transaction_id () in
+        Ok { address; free_ids; message_cb }
 
-        let to_string t = Dns_forward_config.Address.to_string t.address
+      let to_string t = Dns_forward_config.Address.to_string t.address
 
-        let rpc (t: t) buffer =
-          let buf = buffer in
-          match Dns.Protocol.Server.parse (Cstruct.sub buf 0 (Cstruct.length buffer)) with
-          | Some request ->
+      let rpc ~sw _clock net (t : t) buffer =
+        let buf = buffer in
+        match
+          Dns.Protocol.Server.parse (Cstruct.sub buf 0 (Cstruct.length buffer))
+        with
+        | Some request ->
             (* Although we aren't multiplexing requests on the same flow (unlike the
                Persistent case below) we still rewrite the request id
                - to limit the number of sockets we allocate
                - to work around clients who use predictable request ids *)
 
-              (* The id whose scope is the link to the client *)
-              let client_id = request.Dns.Packet.id in
-              (* The id whose scope is the link to the server *)
-              Dns_forward_free_id.with_id t.free_ids
-                (fun free_id ->
-                  (* Copy the buffer since this function will be run in parallel with the
-                     same buffer *)
-                  let buffer =
-                    let tmp = Cstruct.create (Cstruct.length buffer) in
-                    Cstruct.blit buffer 0 tmp 0 (Cstruct.length buffer);
-                    tmp in
-                  (* Rewrite the query id before forwarding *)
-                  Cstruct.BE.set_uint16 buffer 0 free_id;
-                  Log.debug (fun f -> f "%s mapping DNS id %d -> %d" (to_string t) client_id free_id);
+            (* The id whose scope is the link to the client *)
+            let client_id = request.Dns.Packet.id in
+            (* The id whose scope is the link to the server *)
+            Dns_forward_free_id.with_id t.free_ids (fun free_id ->
+                (* Copy the buffer since this function will be run in parallel with the
+                   same buffer *)
+                let buffer =
+                  let tmp = Cstruct.create (Cstruct.length buffer) in
+                  Cstruct.blit buffer 0 tmp 0 (Cstruct.length buffer);
+                  tmp
+                in
+                (* Rewrite the query id before forwarding *)
+                Cstruct.BE.set_uint16 buffer 0 free_id;
+                Log.debug (fun f ->
+                    f "%s mapping DNS id %d -> %d" (to_string t) client_id
+                      free_id);
 
-                  let open Lwt_result.Infix in
-                  Sockets.connect (t.address.Dns_forward_config.Address.ip, t.address.Dns_forward_config.Address.port)
-                  >>= fun flow ->
-                  Lwt.finalize
-                    (fun () ->
-                      let rw = Packet.connect flow in
-                      let open Lwt.Infix in
-                      t.message_cb ~dst:t.address ~buf:buffer ()
-                      >>= fun () ->
-                      let open Lwt_result.Infix in
+                match
+                  Sockets.connect ~sw ~net
+                    ( t.address.Dns_forward_config.Address.ip,
+                      t.address.Dns_forward_config.Address.port )
+                with
+                | Error _ as e -> e
+                | Ok flow ->
+                    Fun.protect
+                      (fun () ->
+                        let rw = Packet.connect flow in
+                        t.message_cb ~dst:t.address ~buf:buffer ();
 
-                      (* An existing connection to the server might have been closed by the server;
-                        therefore if we fail to write the request, reconnect and try once more. *)
-                      Packet.write rw buffer
-                      >>= fun () ->
-                      Packet.read rw
-                      >>= fun buf ->
-                      let open Lwt.Infix in
-                      t.message_cb ~src:t.address ~buf ()
-                      >>= fun () ->
-                      (* Rewrite the query id back to the original *)
-                      Cstruct.BE.set_uint16 buf 0 client_id;
-                      Lwt_result.return buf
-                    ) (fun () ->
-                      Sockets.close flow
-                    )
-                )
-          | _ ->
-          Log.err (fun f -> f "%s: rpc: failed to parse request" (to_string t));
-          Lwt_result.fail (`Msg (to_string t ^ ":failed to parse request"))
+                        (* An existing connection to the server might have been closed by the server;
+                           therefore if we fail to write the request, reconnect and try once more. *)
+                        Packet.write rw buffer >>= fun () ->
+                        Packet.read rw >>= fun buf ->
+                        t.message_cb ~src:t.address ~buf ();
+                        (* Rewrite the query id back to the original *)
+                        Cstruct.BE.set_uint16 buf 0 client_id;
+                        Ok buf)
+                      ~finally:(fun () -> Sockets.close flow))
+        | _ ->
+            Log.err (fun f ->
+                f "%s: rpc: failed to parse request" (to_string t));
+            Error (`Msg (to_string t ^ ":failed to parse request"))
 
-        let disconnect _ =
-          Lwt.return_unit
+      let disconnect _ = ()
     end
   end
 
   module Persistent = struct
-  module Make
-      (Sockets: Dns_forward_s.FLOW_CLIENT with type address = Ipaddr.t * int)
-      (Packet: Dns_forward_s.READERWRITER with type flow = Sockets.flow)
-      (Time: Mirage_time.S) = struct
-    type address = Dns_forward_config.Address.t
-    type request = Cstruct.t
-    type response = Cstruct.t
+    module Make
+        (Sockets : Dns_forward_s.FLOW_CLIENT with type address = Ipaddr.t * int)
+        (Packet : Dns_forward_s.READERWRITER with type flow = Sockets.flow) =
+    struct
+      open Eio
 
-    type message_cb = ?src:address -> ?dst:address -> buf:Cstruct.t -> unit -> unit Lwt.t
+      type address = Dns_forward_config.Address.t
+      type request = Cstruct.t
+      type response = Cstruct.t
 
-    type t = {
-      address: address;
-      mutable client_address: address;
-      mutable rw: Packet.t option;
-      mutable disconnect_on_idle: unit Lwt.t;
-      wakeners: (int, Dns.Packet.question * ((Cstruct.t, [ `Msg of string ]) result Lwt.u)) Hashtbl.t;
-      m: Lwt_mutex.t;
-      free_ids: Dns_forward_free_id.t;
-      message_cb: message_cb;
-    }
+      type message_cb =
+        ?src:address -> ?dst:address -> buf:Cstruct.t -> unit -> unit
 
-    module FlowError = Dns_forward_error.FromFlowError(Sockets)
+      type t = {
+        address : address;
+        mutable client_address : address;
+        mutable rw : Packet.t option;
+        mutable disconnect_on_idle : unit;
+        wakeners :
+          ( int,
+            Dns.Packet.question * (Cstruct.t, exn) result Eio.Promise.u )
+          Hashtbl.t;
+        m : Eio.Mutex.t;
+        free_ids : Dns_forward_free_id.t;
+        message_cb : message_cb;
+      }
 
-    let to_string t = Dns_forward_config.Address.to_string t.client_address
+      module FlowError = Dns_forward_error.FromFlowError (Sockets)
 
-    let disconnect t =
-      Lwt_mutex.with_lock t.m
-        (fun () ->
-           match t with
-           | { rw = Some rw; _ } as t ->
-               t.rw <- None;
-               let error = Error (`Msg (to_string t ^ ": connection to server was closed")) in
-               Hashtbl.iter (fun id (question, u) ->
-                   Log.info (fun f -> f "%s %04x: disconnect: failing request for question %s"
-                                (to_string t) id
-                                (Dns.Packet.question_to_string question)
-                            );
-                   (* It's possible that the response just arrived but hasn't been
-                      processed by the client thread *)
-                   try Lwt.wakeup_later u error
-                   with Invalid_argument _ ->
-                     Log.warn (fun f -> f "%s %04x: disconnect: response for DNS request just arrived in time" (to_string t) id)
-                 ) t.wakeners;
-               Packet.close rw
-           | _ -> Lwt.return_unit
-        )
+      let to_string t = Dns_forward_config.Address.to_string t.client_address
 
-    (* Receive all the responses and demux to the right thread. When the connection
-       is closed, `read_buffer` will fail and this thread will exit. *)
-    let dispatcher t rw () =
-      let open Lwt.Infix in
-      let rec loop () =
-        Packet.read rw
-        >>= function
-        | Error (`Msg m) ->
-            Log.debug (fun f -> f "%s: dispatcher shutting down: %s" (to_string t) m);
-            disconnect t
-        | Ok buffer ->
-            let buf = buffer in
-            begin match Dns.Protocol.Server.parse (Cstruct.sub buf 0 (Cstruct.length buffer)) with
-            | Some ({ Dns.Packet.questions = [ question ]; _ } as response) ->
-                let client_id = response.Dns.Packet.id in
-                if Hashtbl.mem t.wakeners client_id then begin
-                  let expected_question, u = Hashtbl.find t.wakeners client_id in
-                  if expected_question <> question then begin
-                    Log.warn (fun f -> f "%s %04x: response arrived for a different question: expected %s <> got %s"
-                                 (to_string t) client_id
-                                 (Dns.Packet.question_to_string expected_question)
-                                 (Dns.Packet.question_to_string question)
-                             )
-                  end else begin
-                    (* It's possible that disconnect has already failed the thread *)
-                    try Lwt.wakeup_later u (Ok buffer)
+      let disconnect t =
+        Mutex.use_ro t.m (fun () ->
+            match t with
+            | { rw = Some rw; _ } as t ->
+                t.rw <- None;
+                let error =
+                  Failure (to_string t ^ ": connection to server was closed")
+                in
+                Hashtbl.iter
+                  (fun id (question, u) ->
+                    Log.info (fun f ->
+                        f "%s %04x: disconnect: failing request for question %s"
+                          (to_string t) id
+                          (Dns.Packet.question_to_string question));
+                    (* It's possible that the response just arrived but hasn't been
+                       processed by the client thread *)
+                    try Promise.resolve_error u error
                     with Invalid_argument _ ->
-                      Log.warn (fun f -> f "%s %04x: response arrived for DNS request just after disconnection" (to_string t) client_id)
-                  end
-                end else begin
-                  Log.debug (fun f -> f "%s %04x: no wakener: it was probably cancelled" (to_string t) client_id);
-                end;
-                loop ()
-            | _ ->
-                Log.err (fun f -> f "%s: dispatcher failed to parse response" (to_string t));
-                Lwt.fail (Failure "failed to parse response")
-            end
-      in
-      Lwt.catch loop
-        (fun e ->
-           Log.info (fun f -> f "%s dispatcher caught %s" (to_string t) (Printexc.to_string e));
-           Lwt.return_unit
-        )
+                      Log.warn (fun f ->
+                          f
+                            "%s %04x: disconnect: response for DNS request \
+                             just arrived in time"
+                            (to_string t) id))
+                  t.wakeners;
+                Packet.close rw
+            | _ -> ())
 
-    let get_rw t =
-      let open Lwt_result.Infix in
-      Lwt.cancel t.disconnect_on_idle;
-      Lwt_mutex.with_lock t.m
-        (fun () -> match t.rw with
-          | None ->
-              Sockets.connect (t.address.Dns_forward_config.Address.ip, t.address.Dns_forward_config.Address.port)
-              >>= fun flow ->
-              let rw = Packet.connect flow in
-              t.rw <- Some rw;
-              Lwt.async (dispatcher t rw);
-              Lwt_result.return rw
-          | Some rw ->
-              Lwt_result.return rw)
-      >>= fun rw ->
-      (* Add a fresh idle timer *)
-      t.disconnect_on_idle <- (let open Lwt.Infix in Time.sleep_ns Duration.(of_sec 30) >>= fun () -> disconnect t);
-      Lwt_result.return rw
+      (* Receive all the responses and demux to the right thread. When the connection
+         is closed, `read_buffer` will fail and this thread will exit. *)
+      let dispatcher t rw () =
+        let rec loop () =
+          match Packet.read rw with
+          | Error (`Msg m) ->
+              Log.debug (fun f ->
+                  f "%s: dispatcher shutting down: %s" (to_string t) m);
+              disconnect t
+          | Ok buffer -> (
+              let buf = buffer in
+              match
+                Dns.Protocol.Server.parse
+                  (Cstruct.sub buf 0 (Cstruct.length buffer))
+              with
+              | Some ({ Dns.Packet.questions = [ question ]; _ } as response) ->
+                  let client_id = response.Dns.Packet.id in
+                  if Hashtbl.mem t.wakeners client_id then
+                    let expected_question, u =
+                      Hashtbl.find t.wakeners client_id
+                    in
+                    if expected_question <> question then
+                      Log.warn (fun f ->
+                          f
+                            "%s %04x: response arrived for a different \
+                             question: expected %s <> got %s"
+                            (to_string t) client_id
+                            (Dns.Packet.question_to_string expected_question)
+                            (Dns.Packet.question_to_string question))
+                    else
+                      (* It's possible that disconnect has already failed the thread *)
+                      try Promise.resolve u (Ok buffer)
+                      with Invalid_argument _ ->
+                        Log.warn (fun f ->
+                            f
+                              "%s %04x: response arrived for DNS request just \
+                               after disconnection"
+                              (to_string t) client_id)
+                  else
+                    Log.debug (fun f ->
+                        f "%s %04x: no wakener: it was probably cancelled"
+                          (to_string t) client_id);
+                  loop ()
+              | _ ->
+                  Log.err (fun f ->
+                      f "%s: dispatcher failed to parse response" (to_string t));
+                  raise (Failure "failed to parse response"))
+        in
+        try loop ()
+        with e ->
+          Log.info (fun f ->
+              f "%s dispatcher caught %s" (to_string t) (Printexc.to_string e))
 
-    let connect ~gen_transaction_id ?(message_cb = fun ?src:_ ?dst:_ ~buf:_ () -> Lwt.return_unit) address =
-      let rw = None in
-      let m = Lwt_mutex.create () in
-      let disconnect_on_idle = Lwt.return_unit in
-      let wakeners = Hashtbl.create 7 in
-      let free_ids = Dns_forward_free_id.make ~g:gen_transaction_id () in
-      let client_address = { Dns_forward_config.Address.ip = Ipaddr.V4 Ipaddr.V4.localhost; port = 0 } in
-      Lwt_result.return { client_address; address; rw; disconnect_on_idle; wakeners; m; free_ids; message_cb }
+      let get_rw ~sw clock net t =
+        (* Lwt.cancel t.disconnect_on_idle; *)
+        let rw =
+          Mutex.use_ro t.m (fun () ->
+              match t.rw with
+              | None ->
+                  Sockets.connect ~sw ~net
+                    ( t.address.Dns_forward_config.Address.ip,
+                      t.address.Dns_forward_config.Address.port )
+                  >>= fun flow ->
+                  let rw = Packet.connect flow in
+                  t.rw <- Some rw;
+                  Fiber.fork ~sw (dispatcher t rw);
+                  Ok rw
+              | Some rw -> Ok rw)
+        in
+        (* Add a fresh idle timer *)
+        t.disconnect_on_idle <-
+          (Time.sleep clock 30.;
+           disconnect t);
+        rw
 
-    let rpc (t: t) buffer =
-      let buf = buffer in
-      match Dns.Protocol.Server.parse (Cstruct.sub buf 0 (Cstruct.length buffer)) with
-      | Some ({ Dns.Packet.questions = [ question ]; _ } as request) ->
-          (* Note: the received request id is scoped to the connection with the
-             client. Since we are multiplexing requests to a single server we need
-             to track used/unused ids on the link to the server and remember the
-             mapping to the client. *)
+      let connect ~gen_transaction_id
+          ?(message_cb = fun ?src:_ ?dst:_ ~buf:_ () -> ()) address =
+        let rw = None in
+        let m = Mutex.create () in
+        let disconnect_on_idle = () in
+        let wakeners = Hashtbl.create 7 in
+        let free_ids = Dns_forward_free_id.make ~g:gen_transaction_id () in
+        let client_address =
+          {
+            Dns_forward_config.Address.ip = Ipaddr.V4 Ipaddr.V4.localhost;
+            port = 0;
+          }
+        in
+        Ok
+          {
+            client_address;
+            address;
+            rw;
+            disconnect_on_idle;
+            wakeners;
+            m;
+            free_ids;
+            message_cb;
+          }
 
-          (* The id whose scope is the link to the client *)
-          let client_id = request.Dns.Packet.id in
-          (* The id whose scope is the link to the server *)
-          Dns_forward_free_id.with_id t.free_ids
-            (fun free_id ->
-               Lwt.finalize
-                 (fun () ->
+      let rpc ~sw clock net (t : t) buffer =
+        let buf = buffer in
+        match
+          Dns.Protocol.Server.parse (Cstruct.sub buf 0 (Cstruct.length buffer))
+        with
+        | Some ({ Dns.Packet.questions = [ question ]; _ } as request) ->
+            (* Note: the received request id is scoped to the connection with the
+               client. Since we are multiplexing requests to a single server we need
+               to track used/unused ids on the link to the server and remember the
+               mapping to the client. *)
+
+            (* The id whose scope is the link to the client *)
+            let client_id = request.Dns.Packet.id in
+            (* The id whose scope is the link to the server *)
+            Dns_forward_free_id.with_id t.free_ids (fun free_id ->
+                Fun.protect
+                  (fun () ->
                     (* Copy the buffer since this function will be run in parallel with the
                        same buffer *)
                     let buffer =
                       let tmp = Cstruct.create (Cstruct.length buffer) in
                       Cstruct.blit buffer 0 tmp 0 (Cstruct.length buffer);
-                      tmp in
+                      tmp
+                    in
                     (* Rewrite the query id before forwarding *)
                     Cstruct.BE.set_uint16 buffer 0 free_id;
-                    Log.debug (fun f -> f "%s mapping DNS id %d -> %d" (to_string t) client_id free_id);
+                    Log.debug (fun f ->
+                        f "%s mapping DNS id %d -> %d" (to_string t) client_id
+                          free_id);
 
-                    let th, u = Lwt.task () in
+                    let th, u = Promise.create () in
                     Hashtbl.replace t.wakeners free_id (question, u);
 
                     (* If we fail to connect, return the error *)
-                    let open Lwt.Infix in
-                    begin
-                      let open Lwt_result.Infix in
-                      get_rw t
-                      >>= fun rw ->
-                      let open Lwt.Infix in
-                      t.message_cb ~dst:t.address ~buf:buffer ()
-                      >>= fun () ->
+                    let v =
+                      get_rw ~sw clock net t >>= fun rw ->
+                      t.message_cb ~dst:t.address ~buf:buffer ();
                       (* An existing connection to the server might have been closed by the server;
                          therefore if we fail to write the request, reconnect and try once more. *)
-                      Packet.write rw buffer
-                      >>= function
-                      | Ok () ->
-                          Lwt_result.return ()
-                      | Error (`Msg m) ->
-                          Log.info (fun f -> f "%s: caught %s writing request, attempting to reconnect" (to_string t) m);
-                          disconnect t
-                          >>= fun () ->
-                          let open Lwt_result.Infix in
-                          get_rw t
-                          >>= fun rw ->
-                          let open Lwt.Infix in
-                          t.message_cb ~dst:t.address ~buf:buffer ()
-                          >>= fun () ->
-                          Packet.write rw buffer
-                    end
-                    >>= function
-                    | Error (`Msg m) ->
-                        Lwt_result.fail (`Msg m)
+                      match Packet.write rw buffer with
+                      | Ok () -> Ok ()
+                      | Error (`Msg m) -> (
+                          Log.info (fun f ->
+                              f
+                                "%s: caught %s writing request, attempting to \
+                                 reconnect"
+                                (to_string t) m);
+                          disconnect t;
+                          match get_rw ~sw clock net t with
+                          | Error _ as e -> e
+                          | Ok rw ->
+                              t.message_cb ~dst:t.address ~buf:buffer ();
+                              Packet.write rw buffer)
+                    in
+                    match v with
+                    | Error (`Msg m) -> Error (`Msg m)
                     | Ok () ->
-                        let open Lwt_result.Infix in
-                        th (* will be woken up by the dispatcher *)
-                        >>= fun buf ->
-                        let open Lwt.Infix in
-                        t.message_cb ~src:t.address ~buf ()
-                        >>= fun () ->
+                        let buf = Promise.await_exn th in
+                        (* will be woken up by the dispatcher *)
+                        t.message_cb ~src:t.address ~buf ();
                         (* Rewrite the query id back to the original *)
                         Cstruct.BE.set_uint16 buf 0 client_id;
-                        Lwt_result.return buf
-                 ) (fun () ->
-                     (* This happens on cancel, disconnect, successful response *)
-                     Hashtbl.remove t.wakeners free_id;
-                     Lwt.return_unit
-                   )
-            )
-      | _ ->
-          Log.err (fun f -> f "%s: rpc: failed to parse request" (to_string t));
-          Lwt_result.fail (`Msg (to_string t ^ ":failed to parse request"))
+                        Ok buf)
+                  ~finally:(fun () ->
+                    (* This happens on cancel, disconnect, successful response *)
+                    Hashtbl.remove t.wakeners free_id))
+        | _ ->
+            Log.err (fun f ->
+                f "%s: rpc: failed to parse request" (to_string t));
+            Error (`Msg (to_string t ^ ":failed to parse request"))
+    end
   end
-end
 end
 
 module Server = struct
-
   module type S = Dns_forward_s.RPC_SERVER
 
   module Make
-      (Sockets: Dns_forward_s.FLOW_SERVER with type address = Ipaddr.t * int)
-      (Packet : Dns_forward_s.READERWRITER with type flow = Sockets.flow)
-      (Time   : Mirage_time.S) =
+      (Sockets : Dns_forward_s.FLOW_SERVER with type address = Ipaddr.t * int)
+      (Packet : Dns_forward_s.READERWRITER with type flow = Sockets.flow) =
   struct
+    open Eio
 
     type address = Dns_forward_config.Address.t
     type request = Cstruct.t
     type response = Cstruct.t
+    type server = { address : address; server : Sockets.server }
 
-    type server = {
-      address: address;
-      server: Sockets.server;
-    }
+    let bind ~sw net address =
+      Sockets.bind ~sw net
+        ( address.Dns_forward_config.Address.ip,
+          address.Dns_forward_config.Address.port )
+      >>= fun server -> Ok { address; server }
 
-    let bind address =
-      let open Lwt_result.Infix in
-      Sockets.bind (address.Dns_forward_config.Address.ip, address.Dns_forward_config.Address.port)
-      >>= fun server ->
-      Lwt_result.return { address; server }
-
-    let listen { server; _ } cb =
-      Sockets.listen server (fun flow ->
-          let open Lwt.Infix in
+    let listen ~sw { server; _ } cb =
+      Sockets.listen ~sw server (fun flow ->
           let rw = Packet.connect flow in
           let rec loop () =
-            let open Lwt_result.Infix in
-            Packet.read rw
-            >>= fun request ->
-            Lwt.async
-              (fun () ->
-                 let open Lwt.Infix in
-                 cb request
-                 >>= function
-                 | Error _ ->
-                     Lwt.return_unit
-                 | Ok response ->
-                     Packet.write rw response
-                     >>= fun _ ->
-                     Lwt.return_unit
-              );
-            loop () in
-          loop ()
-          >>= function
+            Packet.read rw >>= fun request ->
+            Fiber.fork ~sw (fun () ->
+                match cb request with
+                | Error _ -> ()
+                | Ok response -> ignore (Packet.write rw response));
+            loop ()
+          in
+          match loop () with
           | Error (`Msg m) ->
-              Log.err (fun f -> f "server loop failed with: %s" m);
-              Lwt.return_unit
-          | Ok () ->
-              Lwt.return_unit
-        );
-      Lwt_result.return ()
+              Log.err (fun f -> f "server loop failed with: %s" m)
+          | Ok () -> ());
+      Ok ()
 
-    let shutdown server =
-      Sockets.shutdown server.server
-
+    let shutdown server = Sockets.shutdown server.server
   end
 end

@@ -14,46 +14,45 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  *)
+open Eio
 
-module IntSet = Set.Make(struct type t = int let compare (a: int) (b: int) = compare a b end)
+module IntSet = Set.Make (struct
+  type t = int
+
+  let compare (a : int) (b : int) = compare a b
+end)
 
 (* track the ids in use to
    - avoid accidental re-use
    - limit the total number of simultaneous upstream requests
 *)
 type t = {
-  mutable used_ids: IntSet.t; (* used by in-progress requests *)
-  max_elements: int; (* bound on the number of in-progress requests *)
-  free_ids_c: unit Lwt_condition.t;
-  g: int -> int; (* generate unpredictable id *)
+  mutable used_ids : IntSet.t; (* used by in-progress requests *)
+  max_elements : int; (* bound on the number of in-progress requests *)
+  free_ids_c : Eio.Condition.t;
+  g : int -> int; (* generate unpredictable id *)
 }
 
 let make ~g ?(max_elements = 512) () =
   let used_ids = IntSet.empty in
-  let free_ids_c = Lwt_condition.create () in
+  let free_ids_c = Eio.Condition.create () in
   { max_elements; used_ids; free_ids_c; g }
 
 let rec with_id t f =
-  let open Lwt.Infix in
-  if IntSet.cardinal t.used_ids = t.max_elements then begin
-    Lwt_condition.wait t.free_ids_c
-    >>= fun () ->
-    with_id t f
-  end else begin
+  if IntSet.cardinal t.used_ids = t.max_elements then (
+    Condition.await_no_mutex t.free_ids_c;
+    with_id t f)
+  else
     let rec find_free_id () =
       (* [gen n] picks a value in the interval [0, n-1]. DNS transaction
          ids are between [0, 0xffff] *)
       let id = t.g 0x10000 in
-      if IntSet.mem id t.used_ids
-      then find_free_id ()
-      else id in
+      if IntSet.mem id t.used_ids then find_free_id () else id
+    in
     let free_id = find_free_id () in
     t.used_ids <- IntSet.add free_id t.used_ids;
-    Lwt.finalize
-    (fun () -> f free_id)
-    (fun () ->
-       t.used_ids <- IntSet.remove free_id t.used_ids;
-       Lwt_condition.signal t.free_ids_c ();
-       Lwt.return_unit
-    )
-  end
+    Fun.protect
+      (fun () -> f free_id)
+      ~finally:(fun () ->
+        t.used_ids <- IntSet.remove free_id t.used_ids;
+        Condition.broadcast t.free_ids_c)
