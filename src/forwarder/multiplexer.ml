@@ -41,8 +41,8 @@ module Make (Flow : Mirage_flow.S) = struct
       ; write: Window.t
       ; mutable incoming: Cstruct.t list
       ; mutable incoming_shutdown: bool
-      ; incoming_c: unit Lwt_condition.t
-      ; write_c: unit Lwt_condition.t
+      ; incoming_c: Eio.Condition.t
+      ; write_c: Eio.Condition.t
       ; mutable close_sent: bool
       ; mutable close_received: bool
       ; mutable shutdown_sent: bool
@@ -53,8 +53,8 @@ module Make (Flow : Mirage_flow.S) = struct
       ; write= Window.create ()
       ; incoming= []
       ; incoming_shutdown= false
-      ; incoming_c= Lwt_condition.create ()
-      ; write_c= Lwt_condition.create ()
+      ; incoming_c= Eio.Condition.create ()
+      ; write_c= Eio.Condition.create ()
       ; close_sent= false
       ; close_received= false
       ; shutdown_sent= false
@@ -65,14 +65,12 @@ module Make (Flow : Mirage_flow.S) = struct
 
   exception Multiplexer_failed
 
-  open Lwt.Infix
-
   type outer =
     { label: string
     ; (* for debug logging *)
       channel: C.t
     ; flow: Flow.flow
-    ; m: Lwt_mutex.t
+    ; m: Eio.Mutex.t
     ; (* held when writing frames *)
       subflows: (int32, Subflow.t) Hashtbl.t
     ; mutable next_subflowid: int32
@@ -99,13 +97,10 @@ module Make (Flow : Mirage_flow.S) = struct
     C.write_buffer outer.channel header
 
   let flush outer =
-    Lwt_mutex.with_lock outer.m (fun () ->
-        C.flush outer.channel
-        >>= function
-        | Ok () -> Lwt.return_unit | Error _ -> Lwt.fail Multiplexer_failed )
-    >>= fun () ->
-    Log.debug (fun f -> f "%s: flushed" outer.label) ;
-    Lwt.return_unit
+    Eio.Mutex.use_ro outer.m (fun () ->
+        match C.flush outer.channel with
+        | Ok () -> () | Error _ -> raise Multiplexer_failed );
+    Log.debug (fun f -> f "%s: flushed" outer.label)
 
   module Channel = struct
     type channel = {outer: outer; id: int32; subflow: Subflow.t}
@@ -115,7 +110,7 @@ module Make (Flow : Mirage_flow.S) = struct
         Window.advertise channel.subflow.Subflow.read
           channel.outer.max_buffer_size
       with
-      | None -> Lwt.return_unit
+      | None -> ()
       | Some seq ->
           send channel.outer Frame.{command= Window seq; id= channel.id};
           flush channel.outer
@@ -124,9 +119,8 @@ module Make (Flow : Mirage_flow.S) = struct
       let subflow = Subflow.create () in
       Hashtbl.add outer.subflows id subflow ;
       let channel = {outer; id; subflow} in
-      send_window_update channel
-      >>= fun () ->
-      Lwt.return channel
+      send_window_update channel;
+      channel
 
     let connect outer destination =
       let find_free_flowid outer =
@@ -152,10 +146,11 @@ module Make (Flow : Mirage_flow.S) = struct
         match channel.subflow.Subflow.incoming with
         | [] ->
             if is_read_eof channel
-            then Lwt.return (Ok `Eof)
-            else
-              Lwt_condition.wait channel.subflow.Subflow.incoming_c
-              >>= fun () -> wait ()
+            then Ok `Eof
+            else begin
+              Eio.Condition.await_no_mutex channel.subflow.Subflow.incoming_c;
+              wait ()
+            end
         | first :: rest ->
             let num_from_first = min (Cstruct.length first) (Cstruct.length buf) in
             Cstruct.blit first 0 buf 0 num_from_first;
@@ -167,9 +162,8 @@ module Make (Flow : Mirage_flow.S) = struct
               then rest
               else first :: rest;
             if Cstruct.length buf = 0 then begin
-              send_window_update channel
-              >>= fun () ->
-              Lwt.return (Ok (`Data ()))
+              send_window_update channel;
+              Ok (`Data ())
             end else read_into channel buf
       in
       wait ()
@@ -179,16 +173,17 @@ module Make (Flow : Mirage_flow.S) = struct
         match channel.subflow.Subflow.incoming with
         | [] ->
             if is_read_eof channel
-            then Lwt.return (Ok `Eof)
-            else
-              Lwt_condition.wait channel.subflow.Subflow.incoming_c
-              >>= fun () -> wait ()
+            then Ok `Eof
+            else begin
+              Eio.Condition.await_no_mutex channel.subflow.Subflow.incoming_c;
+              wait ()
+            end
         | bufs ->
             (channel.subflow).Subflow.incoming <- [] ;
             let len = List.fold_left ( + ) 0 (List.map Cstruct.length bufs) in
             Window.advance channel.subflow.Subflow.read len ;
-            send_window_update channel
-            >>= fun () -> Lwt.return (Ok (`Data (Cstruct.concat bufs)))
+            send_window_update channel;
+            Ok (`Data (Cstruct.concat bufs))
       in
       wait ()
 
@@ -204,14 +199,14 @@ module Make (Flow : Mirage_flow.S) = struct
           if
             Window.size channel.subflow.Subflow.write = 0
             && not (is_write_eof channel)
-          then
-            Lwt_condition.wait channel.subflow.Subflow.write_c
-            >>= fun () -> wait ()
-          else Lwt.return_unit
+          then begin
+            Eio.Condition.await_no_mutex channel.subflow.Subflow.write_c;
+            wait ()
+          end
+          else ()
         in
-        wait ()
-        >>= fun () ->
-        if is_write_eof channel then Lwt.return `Eof
+        wait ();
+        if is_write_eof channel then `Eof
         else
           let len = Window.size channel.subflow.Subflow.write in
           let to_send, remaining =
@@ -228,19 +223,17 @@ module Make (Flow : Mirage_flow.S) = struct
                   ; id= channel.id } ;
               C.write_buffer channel.outer.channel buf )
             to_send ;
-          flush channel.outer
-          >>= fun () ->
-          if remaining = [] then Lwt.return `Ok else loop remaining
+          flush channel.outer;
+          if remaining = [] then `Ok else loop remaining
       in
-      loop bufs
-      >>= fun _ ->
+      let _ = loop bufs in
       (* FIXME: consider `Eof *)
-      Lwt.return (Ok ())
+      Ok ()
 
     let shutdown_write channel =
       (* Avoid sending Shutdown twice or sending a shutdown after a Close *)
       if is_write_eof channel
-      then Lwt.return_unit
+      then ()
       else begin
         channel.subflow.Subflow.shutdown_sent <- true;
         send channel.outer Frame.{command= Shutdown; id= channel.id} ;
@@ -250,7 +243,7 @@ module Make (Flow : Mirage_flow.S) = struct
     let close channel =
       (* Don't send Close more than once *)
       if channel.subflow.Subflow.close_sent
-      then Lwt.return_unit
+      then ()
       else begin
         (channel.subflow).Subflow.close_sent <- true ;
         send channel.outer Frame.{command= Close; id= channel.id} ;
@@ -259,7 +252,7 @@ module Make (Flow : Mirage_flow.S) = struct
       end
 
     (* boilerplate: *)
-    let shutdown_read _chanel = Lwt.return_unit
+    let shutdown_read _chanel = ()
 
     let write channel buf = writev channel [buf]
 
@@ -278,11 +271,11 @@ module Make (Flow : Mirage_flow.S) = struct
 
   let is_running flow = flow.running
 
-  type listen_cb = Channel.flow -> Frame.Destination.t -> unit Lwt.t
+  type listen_cb = Channel.flow -> Frame.Destination.t -> unit
 
-  let connect flow label listen_cb =
+  let connect ~sw flow label listen_cb =
     let channel = C.create flow in
-    let m = Lwt_mutex.create () in
+    let m = Eio.Mutex.create () in
     let subflows = Hashtbl.create 7 in
     let next_subflowid = Int32.max_int in
     let max_buffer_size = 65536 in
@@ -291,28 +284,26 @@ module Make (Flow : Mirage_flow.S) = struct
     in
     (* Process incoming data, window advertisements *)
     let handle_one () =
-      C.read_exactly ~len:2 channel
-      >>= function
+      match C.read_exactly ~len:2 channel with
       | Error _ ->
           Log.err (fun f -> f "%s: error while reading frame length" label) ;
-          Lwt.return false
+          false
       | Ok `Eof ->
           Log.err (fun f -> f "%s: EOF reading frame length" label) ;
-          Lwt.return false
+          false
       | Ok (`Data bufs) -> (
           let buf = Cstruct.concat bufs in
           let len = Cstruct.LE.get_uint16 buf 0 in
-          C.read_exactly ~len:(len - 2) channel
-          >>= function
+          match C.read_exactly ~len:(len - 2) channel with
           | Error _ ->
               Log.err (fun f ->
                   f "%s: error while reading frame header (length %d)" label
                     len ) ;
-              Lwt.return false
+              false
           | Ok `Eof ->
               Log.err (fun f ->
                   f "%s: EOF reading frame header (length %d)" label len ) ;
-              Lwt.return false
+              false
           | Ok (`Data rest) -> (
               let header = Cstruct.concat (bufs @ rest) in
               try
@@ -321,70 +312,67 @@ module Make (Flow : Mirage_flow.S) = struct
                 Log.debug (fun f -> f "%s: recv %s" label (to_string frame)) ;
                 match frame.command with
                 | Open (Dedicated, _) ->
-                    Lwt.fail_with "dispatcher lacks support for dedicated mode"
+                    failwith "dispatcher lacks support for dedicated mode"
                 | Open (Multiplexed, destination) ->
-                    Channel.create outer frame.id
-                    >>= fun channel ->
-                    Lwt.async (fun () -> listen_cb channel destination) ;
-                    Lwt.return true
+                    let channel = Channel.create outer frame.id in
+                    Eio.Fiber.fork ~sw (fun () -> listen_cb channel destination) ;
+                    true
                 | Close ->
                     let subflow = Hashtbl.find subflows frame.id in
                     subflow.Subflow.close_received <- true ;
                     (* Unblock any waiting read *)
-                    Lwt_condition.signal subflow.incoming_c () ;
+                    Eio.Condition.signal subflow.incoming_c;
                     (* Unblock any waiting write *)
-                    Lwt_condition.signal subflow.write_c () ;
+                    Eio.Condition.signal subflow.write_c;
                     decr_refcount outer frame.id ;
-                    Lwt.return true
+                    true
                 | Shutdown ->
                     let subflow = Hashtbl.find subflows frame.id in
                     subflow.Subflow.incoming_shutdown <- true ;
                     (* Unblock any waiting read *)
-                    Lwt_condition.signal subflow.incoming_c () ;
-                    Lwt.return true
+                    Eio.Condition.signal subflow.incoming_c;
+                    true
                 | Data len -> (
                     let subflow = Hashtbl.find subflows frame.id in
                     let len = Int32.to_int len in
-                    C.read_exactly ~len channel
-                    >>= function
+                    match C.read_exactly ~len channel with
                     | Error _ ->
                         Log.err (fun f ->
                             f "%s: error while reading payload (length %d)"
                               label len ) ;
-                        Lwt.return false
+                        false
                     | Ok `Eof ->
                         Log.err (fun f ->
                             f "%s: EOF while reading payload (length %d)" label
                               len ) ;
-                        Lwt.return false
+                        false
                     | Ok (`Data bufs) ->
                         subflow.Subflow.incoming
                         <- subflow.Subflow.incoming @ bufs ;
                         (* Unblock any waiting read *)
-                        Lwt_condition.signal subflow.incoming_c () ;
-                        Lwt.return true )
+                        Eio.Condition.signal subflow.incoming_c;
+                        true )
                 | Window seq ->
                     let subflow = Hashtbl.find subflows frame.id in
                     Window.receive subflow.Subflow.write seq ;
                     (* Unblock any waiting write *)
-                    Lwt_condition.signal subflow.write_c () ;
-                    Lwt.return true
+                    Eio.Condition.signal subflow.write_c;
+                    true
               with e ->
                 Log.err (fun f ->
                     f "%s: error handling frame: %s" label
                       (Printexc.to_string e) ) ;
-                Lwt.return false ) )
+                false ) )
     in
     let rec dispatcher () =
-      handle_one ()
-      >>= function
+      match handle_one () with
       | false ->
           Log.err (fun f -> f "%s: dispatcher shutting down" label) ;
-          outer.running <- false;
-          Lwt.return_unit
+          outer.running <- false
       | true -> dispatcher ()
     in
-    Lwt.async dispatcher ; outer
+    Eio.Fiber.fork ~sw dispatcher;
+    outer
 
   let disconnect m = Flow.close m.flow
 end
