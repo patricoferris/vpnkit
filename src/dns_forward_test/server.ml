@@ -81,7 +81,6 @@ module Make(Server: Rpc.Server.S) = struct
     let open Error in
     Server.bind ~sw net address
     >>= fun server ->
-    Logs.debug (fun f -> f "Successful bind");
     Server.listen ~sw server (fun buf -> answer buf t)
     >>= fun () ->
     Ok server

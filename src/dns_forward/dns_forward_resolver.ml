@@ -23,15 +23,22 @@ let src =
 module Log = (val Logs.src_log src : Logs.LOG)
 open Eio
 
-let nchoose_split list =
-  let ready, waiting = List.fold_left
-    (fun (term, acc) p ->
-      match Promise.peek p with
-      | Some _ -> (Promise.await_exn p :: term, acc)
-      | None -> (term, p :: acc))
-    ([], []) list
-  in
+let nchoose_split ~sw list =
+  let rec at_least_one () =
+    let ready, waiting = List.fold_left
+      (fun (term, acc) p ->
+        match Promise.peek p with
+        | Some _ -> (Promise.await_exn p :: term, acc)
+        | None -> (term, p :: acc))
+      ([], []) list
+    in
+    if ready = [] then begin
+      Fiber.yield ();
+      at_least_one ()
+    end else
     List.rev ready, List.rev waiting
+  in
+    Fiber.fork_promise ~sw at_least_one
 
 let is_in_domain name domain =
   let name' = List.length name and domain' = List.length domain in
@@ -122,7 +129,7 @@ module Make (Client : Dns_forward_s.RPC_CLIENT) = struct
     config : Dns_forward_config.t;
   }
 
-  let create ?(local_names_cb = fun _ -> None) ~gen_transaction_id ?message_cb
+  let create ?(local_names_cb = fun _ -> None) ~sw ~gen_transaction_id ?message_cb
       config =
     let connections =
       List.map
@@ -139,7 +146,7 @@ module Make (Client : Dns_forward_s.RPC_CLIENT) = struct
         (Dns_forward_config.Server.Set.elements
            config.Dns_forward_config.servers)
     in
-    let cache = Cache.make () in
+    let cache = Cache.make ~sw () in
     { connections; local_names_cb; cache; config }
 
   let destroy t =
@@ -169,205 +176,211 @@ module Make (Client : Dns_forward_s.RPC_CLIENT) = struct
         in
 
         (* Look for any local answers to this question *)
-        match t.local_names_cb question with
-        | Some answers -> Ok (marshal @@ reply answers)
-        | None -> (
-            (* Ask one server, with caching. Possible results are:
-               Ok (`Success buf): succesful reply
-               Ok (`Failure buf): an error like NXDomain
-               Error (`Msg m): a low-level error or timeout
-            *)
-            let one_rpc server =
-              let open Dns_forward_config in
-              let address = server.Server.address in
-              (* Look in the cache *)
-              match Cache.answer t.cache address question with
-              | Some answers -> Ok (`Success (marshal @@ reply answers))
-              | None -> (
-                  let c =
-                    List.find (fun c -> c.server = server) t.connections
-                  in
-                  let now_ns = Time.Mono.now mono in
-                  (* If no timeout is configured, we will stop listening after
-                     5s to avoid leaking threads if a server is offline *)
-                  let timeout_ns =
-                    match server.Server.timeout_ms with
-                    | None -> Duration.of_sec 5
-                    | Some x -> Duration.of_ms x
-                  in
-                  (* If no assume_offline_after_drops is configured then set this
-                     to 5s. *)
-                  let assume_offline_after_drops =
-                    match t.config.assume_offline_after_drops with
-                    | Some c -> c
-                    | None -> 5
-                  in
-                  (* Within the overall timeout_ms (configured by the user) we will send
-                     the request at 1s intervals to guard against packet drops. *)
-                  let delays_ns =
-                    let rec make from =
-                      if from > timeout_ns then []
-                      else from :: make (Int64.add from Duration.(of_sec 1))
+        let v = 
+          match t.local_names_cb question with
+          | Some answers -> Ok (marshal @@ reply answers)
+          | None -> (
+              (* Ask one server, with caching. Possible results are:
+                Ok (`Success buf): succesful reply
+                Ok (`Failure buf): an error like NXDomain
+                Error (`Msg m): a low-level error or timeout
+              *)
+              let one_rpc server =
+                let open Dns_forward_config in
+                let address = server.Server.address in
+                (* Look in the cache *)
+                match Cache.answer t.cache address question with
+                | Some answers -> Ok (`Success (marshal @@ reply answers))
+                | None -> (
+                    let c =
+                      List.find (fun c -> c.server = server) t.connections
                     in
-                    make 0L
-                  in
-                  let requests =
-                    List.map
-                      (fun delay_ns () ->
-                        Eio.Time.sleep clock
-                          (Int64.to_float delay_ns /. 1_000_000_000.);
-                        Client.rpc ~sw clock net c.client buffer)
-                      delays_ns
-                  in
-                  let timeout () =
-                    Eio.Time.sleep clock
-                      (Int64.to_float timeout_ns /. 1_000_000_000.);
-                    Error (`Msg "timeout")
-                  in
-                  match Fiber.any (timeout :: requests) with
-                  | Error x ->
-                      if c.reply_expected_since = None then
-                        c.reply_expected_since <-
-                          Some (Mtime.to_uint64_ns now_ns);
-                      c.replies_missing <-
-                        c.replies_missing + List.length delays_ns;
-                      if
-                        assume_offline_after_drops < c.replies_missing
-                        && c.online
-                      then (
-                        Log.err (fun f ->
-                            f
-                              "Upstream DNS server %s has dropped %d packets \
-                               in a row: assuming it's offline"
-                              (Dns_forward_config.Address.to_string address)
-                              c.replies_missing);
-                        c.online <- false);
-                      Error x
-                  | Ok reply -> (
-                    Logs.debug (fun f -> f "Got a reply!");
-                      c.reply_expected_since <- None;
-                      c.replies_missing <- 0;
-                      if not c.online then (
-                        Log.info (fun f ->
-                            f "Upstream DNS server %s is back online"
-                              (Dns_forward_config.Address.to_string address));
-                        c.online <- true);
-                      (* Determine whether it's a success or a failure; if a success
-                         then insert the value into the cache. *)
-                      let len = Cstruct.length reply in
-                      let buf = reply in
-                      match
-                        Dns.Protocol.Server.parse (Cstruct.sub buf 0 len)
-                      with
-                      | Some
-                          {
-                            detail = { rcode = NoError; _ };
-                            answers = _ :: _ as answers;
-                            _;
-                          } ->
-                          Cache.insert ~clock t.cache address question answers;
-                          Ok (`Success reply)
-                      | packet -> Ok (`Failure (packet, reply))))
-            in
-
-            (* Ask many servers but first
-               - Filter the list of servers using any "zone" setting -- this will
-                 prevent queries for private names being leaked to public servers
-                 (if configured).
-               - Group the servers into lists of equal priorities.
-               - Send all the requests concurrently. *)
-            let many_rpcs connections =
-              let equal_priority_groups =
-                choose_servers
-                  (List.map (fun c -> c.server) connections)
-                  request
+                    let now_ns = Time.Mono.now mono in
+                    (* If no timeout is configured, we will stop listening after
+                      5s to avoid leaking threads if a server is offline *)
+                    let timeout_ns =
+                      match server.Server.timeout_ms with
+                      | None -> Duration.of_sec 5
+                      | Some x -> Duration.of_ms x
+                    in
+                    (* If no assume_offline_after_drops is configured then set this
+                      to 5s. *)
+                    let assume_offline_after_drops =
+                      match t.config.assume_offline_after_drops with
+                      | Some c -> c
+                      | None -> 5
+                    in
+                    (* Within the overall timeout_ms (configured by the user) we will send
+                      the request at 1s intervals to guard against packet drops. *)
+                    let delays_ns =
+                      let rec make from =
+                        if from > timeout_ns then []
+                        else from :: make (Int64.add from Duration.(of_sec 1))
+                      in
+                      make 0L
+                    in
+                    let requests =
+                      List.map
+                        (fun delay_ns () ->
+                          Logs.info (fun f -> f "Delaying for %f" (Int64.to_float delay_ns /. 1_000_000_000.));
+                          (if delay_ns <> 0L then 
+                          (Eio.Time.sleep clock
+                            (Int64.to_float delay_ns /. 1_000_000_000.)));
+                          Logs.info (fun f -> f "REQUEST");
+                          Client.rpc ~sw clock net c.client buffer)
+                        delays_ns
+                    in
+                    let timeout () =
+                      Eio.Time.sleep clock
+                        (Int64.to_float timeout_ns /. 1_000_000_000.);
+                      Error (`Msg "timeout")
+                    in
+                    match Fiber.any (timeout :: requests) with
+                    | Error x ->
+                        if c.reply_expected_since = None then
+                          c.reply_expected_since <-
+                            Some (Mtime.to_uint64_ns now_ns);
+                        c.replies_missing <-
+                          c.replies_missing + List.length delays_ns;
+                        if
+                          assume_offline_after_drops < c.replies_missing
+                          && c.online
+                        then (
+                          Log.err (fun f ->
+                              f
+                                "Upstream DNS server %s has dropped %d packets \
+                                in a row: assuming it's offline"
+                                (Dns_forward_config.Address.to_string address)
+                                c.replies_missing);
+                          c.online <- false);
+                        Error x
+                    | Ok reply -> (
+                        c.reply_expected_since <- None;
+                        c.replies_missing <- 0;
+                        if not c.online then (
+                          Log.info (fun f ->
+                              f "Upstream DNS server %s is back online"
+                                (Dns_forward_config.Address.to_string address));
+                          c.online <- true);
+                        (* Determine whether it's a success or a failure; if a success
+                          then insert the value into the cache. *)
+                        let len = Cstruct.length reply in
+                        let buf = reply in
+                        match
+                          Dns.Protocol.Server.parse (Cstruct.sub buf 0 len)
+                        with
+                        | Some
+                            {
+                              detail = { rcode = NoError; _ };
+                              answers = _ :: _ as answers;
+                              _;
+                            } ->
+                            Cache.insert ~clock t.cache address question answers;
+                            Ok (`Success reply)
+                        | packet -> Ok (`Failure (packet, reply))))
               in
-              (* Send all requests in parallel to minimise the chance of hitting a
-                 timeout. Positive replies will be cached, but servers which don't
-                 recognise the name will be queried each time. *)
-              List.map
-                (List.map (fun d ->
-                     Fiber.fork_promise ~sw (fun () -> one_rpc d)))
-                equal_priority_groups
-            in
 
-            let online, offline =
-              List.partition (fun c -> c.online) t.connections
-            in
-            if online = [] && t.connections <> [] then (
-              let open Dns_forward_config in
-              Log.warn (fun f ->
-                  f "There are no online DNS servers configured.");
-              Log.warn (fun f ->
-                  f "DNS servers %s are all marked offline"
-                    (String.concat ", "
-                       (List.map
-                          (fun c ->
-                            Address.to_string @@ c.server.Server.address)
-                          offline))));
-            (* For all the offline servers, send the requests as a "ping" to see
-               if they are alive or not. Any response will flip them back to online
-               but we won't consider their responses until the next RPC *)
-            let _ = many_rpcs offline in
+              (* Ask many servers but first
+                - Filter the list of servers using any "zone" setting -- this will
+                  prevent queries for private names being leaked to public servers
+                  (if configured).
+                - Group the servers into lists of equal priorities.
+                - Send all the requests concurrently. *)
+              let many_rpcs connections =
+                let equal_priority_groups =
+                  choose_servers
+                    (List.map (fun c -> c.server) connections)
+                    request
+                in
+                (* Send all requests in parallel to minimise the chance of hitting a
+                  timeout. Positive replies will be cached, but servers which don't
+                  recognise the name will be queried each time. *)
+                List.map
+                  (List.map (fun d ->
+                      Fiber.fork_promise ~sw (fun () -> one_rpc d)))
+                  equal_priority_groups
+              in
 
-            (* For all the online servers, send the requests and return the waiting
-               threads. *)
-            let online_results = many_rpcs online in
+              let online, offline =
+                List.partition (fun c -> c.online) t.connections
+              in
+              if online = [] && t.connections <> [] then (
+                let open Dns_forward_config in
+                Log.warn (fun f ->
+                    f "There are no online DNS servers configured.");
+                Log.warn (fun f ->
+                    f "DNS servers %s are all marked offline"
+                      (String.concat ", "
+                        (List.map
+                            (fun c ->
+                              Address.to_string @@ c.server.Server.address)
+                            offline))));
+              (* For all the offline servers, send the requests as a "ping" to see
+                if they are alive or not. Any response will flip them back to online
+                but we won't consider their responses until the next RPC *)
+              let _ = many_rpcs offline in
 
-            (* Wait for the best result from a set of equal priority requests *)
-            let rec wait best_so_far remaining =
-              Logs.debug (fun f -> f "Waiting %i" (List.length remaining));
-              if remaining = [] then best_so_far
-              else
-                let terminated, remaining = nchoose_split remaining in
-                match
-                  List.fold_left
-                    (fun best_so_far next ->
-                      match best_so_far with
-                      | Ok (`Success result) ->
-                          (* No need to wait for any of the rest: one success is good enough *)
-                          Ok (`Success result)
-                      | best_so_far -> (
-                          match (best_so_far, next) with
-                          | _, Ok (`Success result) -> Ok (`Success result)
-                          | ( Ok (`Failure (a_packet, a_reply)),
-                              Ok (`Failure (b_packet, b_reply)) ) -> (
-                              match (a_packet, b_packet) with
-                              (* Prefer NXDomain to errors like Refused *)
-                              | Some { detail = { rcode = NXDomain; _ }; _ }, _
-                                ->
-                                  Ok (`Failure (a_packet, a_reply))
-                              | _, Some { detail = { rcode = NXDomain; _ }; _ }
-                                ->
-                                  Ok (`Failure (b_packet, b_reply))
-                              | _, _ ->
-                                  (* other than that, the earlier error is better *)
-                                  Ok (`Failure (a_packet, a_reply)))
-                          | Error _, Ok (`Failure (b_packet, b_reply)) ->
-                              (* prefer a high-level error over a low-level (e.g. socket) error *)
-                              Ok (`Failure (b_packet, b_reply))
-                          | best_so_far, _ -> best_so_far))
-                    best_so_far terminated
-                with
-                | Ok (`Success result) -> Ok (`Success result)
-                | best_so_far ->
-                  Eio.Fiber.yield ();
-                  wait best_so_far remaining
-            in
-            (* Wait for each equal priority group at a time *)
-            let res =
-              List.fold_left
-                (fun best_so_far next ->
-                  match best_so_far with
+              (* For all the online servers, send the requests and return the waiting
+                threads. *)
+              let online_results = many_rpcs online in
+
+              (* Wait for the best result from a set of equal priority requests *)
+              let rec wait best_so_far remaining =
+                if remaining = [] then best_so_far
+                else
+                  let terminated, remaining = Promise.await_exn (nchoose_split ~sw remaining) in
+                  match
+                    List.fold_left
+                      (fun best_so_far next ->
+                        match best_so_far with
+                        | Ok (`Success result) ->
+                            (* No need to wait for any of the rest: one success is good enough *)
+                            Ok (`Success result)
+                        | best_so_far -> (
+                            match (best_so_far, next) with
+                            | _, Ok (`Success result) -> Ok (`Success result)
+                            | ( Ok (`Failure (a_packet, a_reply)),
+                                Ok (`Failure (b_packet, b_reply)) ) -> (
+                                match (a_packet, b_packet) with
+                                (* Prefer NXDomain to errors like Refused *)
+                                | Some { detail = { rcode = NXDomain; _ }; _ }, _
+                                  ->
+                                    Ok (`Failure (a_packet, a_reply))
+                                | _, Some { detail = { rcode = NXDomain; _ }; _ }
+                                  ->
+                                    Ok (`Failure (b_packet, b_reply))
+                                | _, _ ->
+                                    (* other than that, the earlier error is better *)
+                                    Ok (`Failure (a_packet, a_reply)))
+                            | Error _, Ok (`Failure (b_packet, b_reply)) ->
+                                (* prefer a high-level error over a low-level (e.g. socket) error *)
+                                Ok (`Failure (b_packet, b_reply))
+                            | best_so_far, _ -> best_so_far))
+                      best_so_far terminated
+                  with
                   | Ok (`Success result) -> Ok (`Success result)
-                  | best_so_far -> wait best_so_far next)
-                (Error (`Msg "no servers configured"))
-                online_results
-            in
-            match res with
-            | Ok (`Success reply) -> Ok reply
-            | Ok (`Failure (_, reply)) -> Ok reply
-            | Error x -> Error x))
+                  | best_so_far ->
+                    Eio.Fiber.yield ();
+                    wait best_so_far remaining
+              in
+              (* Wait for each equal priority group at a time *)
+              let res =
+                List.fold_left
+                  (fun best_so_far next ->
+                    match best_so_far with
+                    | Ok (`Success result) -> Ok (`Success result)
+                    | best_so_far -> 
+                      wait best_so_far next)
+                  (Error (`Msg "no servers configured"))
+                  online_results
+              in
+              match res with
+              | Ok (`Success reply) -> Ok reply
+              | Ok (`Failure (_, reply)) -> Ok reply
+              | Error x -> Error x)
+        in
+          v
+        )
     | Some { questions = _; _ } ->
         Error (`Msg "cannot handle DNS packets where len(questions)<>1")
     | None -> Error (`Msg "failed to parse request")

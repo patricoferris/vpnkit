@@ -17,13 +17,6 @@
 
 type 'a t = ('a, [ `Msg of string ]) result
 
-module FromFlowError (Flow : Mirage_flow.S) : sig
-  val ( >>= ) :
-    [< `Eof | `Error of Flow.error | `Ok of 'b ] ->
-    ('b -> ('c, ([> `Msg of string ] as 'd)) result) ->
-    ('c, 'd) result
-end
-
 val errorf :
   ('a, Format.formatter, unit, ('b, [> `Msg of string ]) result) format4 -> 'a
 

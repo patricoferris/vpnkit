@@ -22,9 +22,11 @@ module type Comparable = sig
 end
 
 module type FLOW_CLIENT = sig
-  include Mirage_flow_combinators.SHUTDOWNABLE
-
   type address
+
+  type flow
+
+  val get_flow : flow -> <Eio.Flow.two_way; Eio.Flow.close> option
 
   val connect :
     sw:Eio.Switch.t ->
@@ -36,6 +38,7 @@ end
 
 module type FLOW_SERVER = sig
   type server
+
   type address
 
   val bind :
@@ -47,6 +50,8 @@ module type FLOW_SERVER = sig
   val getsockname : server -> address
 
   type flow
+
+  val get_flow : flow -> <Eio.Flow.two_way; Eio.Flow.close> option
 
   val listen : sw:Eio.Switch.t -> server -> (flow -> unit) -> unit
   val shutdown : server -> unit
@@ -108,6 +113,7 @@ module type RESOLVER = sig
 
   val create :
     ?local_names_cb:(Dns.Packet.question -> Dns.Packet.rr list option) ->
+    sw:Eio.Switch.t ->
     gen_transaction_id:(int -> int) ->
     ?message_cb:message_cb ->
     Dns_forward_config.t ->
@@ -149,9 +155,8 @@ module type READERWRITER = sig
 
   type response = Cstruct.t
   type t
-  type flow
 
-  val connect : flow -> t
+  val connect : <Eio.Flow.two_way; Eio.Flow.close> -> t
   val read : t -> (request, [ `Msg of string ]) result
   val write : t -> response -> (unit, [ `Msg of string ]) result
   val close : t -> unit

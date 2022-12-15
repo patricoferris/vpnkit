@@ -35,18 +35,19 @@ type answer = {
   rrs : Dns.Packet.rr list;
   (* We'll use the Lwt scheduler as a priority queue to expire records, one
      timeout thread per record. *)
-  timeout : unit Lwt.t;
+  cancel_timeout : (unit -> unit);
 }
 
 type t = {
+  sw : Eio.Switch.t;
   max_bindings : int;
   (* For every question we store a mapping of server address to the answer *)
   mutable cache : answer Address.Map.t Question.Map.t;
 }
 
-let make ?(max_bindings = 1024) () =
+let make ?(max_bindings = 1024) ~sw () =
   let cache = Question.Map.empty in
-  { max_bindings; cache }
+  { sw; max_bindings; cache }
 
 let answer t address question =
   if Question.Map.mem question t.cache then
@@ -58,13 +59,13 @@ let answer t address question =
 let remove t question =
   if Question.Map.mem question t.cache then (
     let all = Question.Map.find question t.cache in
-    Address.Map.iter (fun _ answer -> Lwt.cancel answer.timeout) all;
+    Address.Map.iter (fun _ answer -> answer.cancel_timeout ()) all;
     t.cache <- Question.Map.remove question t.cache)
 
 let destroy t =
   Question.Map.iter
     (fun _ all ->
-      Address.Map.iter (fun _ answer -> Lwt.cancel answer.timeout) all)
+      Address.Map.iter (fun _ answer -> answer.cancel_timeout ()) all)
     t.cache;
   t.cache <- Question.Map.empty
 
@@ -88,18 +89,22 @@ let insert ~clock t address question rrs =
     List.fold_left min Int32.max_int
       (List.map (fun rr -> rr.Dns.Packet.ttl) rrs)
   in
-  let timeout =
-    Eio.Time.sleep clock (Int32.to_float min_ttl);
-    (if Question.Map.mem question t.cache then
-     let address_to_answer =
-       Question.Map.find question t.cache |> Address.Map.remove address
-     in
-     if Address.Map.is_empty address_to_answer then
-       t.cache <- Question.Map.remove question t.cache
-     else t.cache <- Question.Map.add question address_to_answer t.cache);
-    Lwt.return_unit
+  let cancel_timeout =
+    let cancel, r = Eio.Promise.create () in
+    Eio.Fiber.fork ~sw:t.sw (fun () ->
+      Eio.Fiber.first (fun () -> 
+        Eio.Time.sleep clock (Int32.to_float min_ttl);
+        (if Question.Map.mem question t.cache then
+        let address_to_answer =
+          Question.Map.find question t.cache |> Address.Map.remove address
+        in
+        if Address.Map.is_empty address_to_answer then
+          t.cache <- Question.Map.remove question t.cache
+        else t.cache <- Question.Map.add question address_to_answer t.cache))
+        (fun () -> Eio.Promise.await cancel));
+    (fun () -> Eio.Promise.resolve r ())
   in
-  let answer = { rrs; timeout } in
+  let answer = { rrs; cancel_timeout } in
   let address_to_answer =
     if Question.Map.mem question t.cache then Question.Map.find question t.cache
     else Address.Map.empty

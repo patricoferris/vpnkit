@@ -14,13 +14,12 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  *)
-
 module type S = Dns_forward_s.READERWRITER
 
-module Tcp (Flow : Mirage_flow.S) : sig
-  include Dns_forward_s.READERWRITER with type flow = Flow.flow
+module Tcp : sig
+  include Dns_forward_s.READERWRITER
 end
 
-module Udp (Flow : Mirage_flow.S) : sig
-  include Dns_forward_s.READERWRITER with type flow = Flow.flow
+module Udp : sig
+  include Dns_forward_s.READERWRITER
 end

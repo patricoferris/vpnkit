@@ -44,9 +44,9 @@ module Clock = struct
 
       method sleep_until time =
           (* All sleeping is relative to the start of the program for now *)
-          let v = 0. in
+          (* let v = 0. in *)
           let rec loop () =
-            if Float.compare now (v +. time) > 0 then () else (
+            if Float.compare now time > 0 then () else (
               Condition.await_no_mutex c;
               loop ()
             ) in

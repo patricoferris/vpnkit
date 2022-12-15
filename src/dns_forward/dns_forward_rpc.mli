@@ -23,13 +23,13 @@ module Client : sig
   module Persistent : sig
     module Make
         (Flow : Dns_forward_s.FLOW_CLIENT with type address = Ipaddr.t * int)
-        (Framing : Dns_forward_s.READERWRITER with type flow = Flow.flow) : S
+        (Framing : Dns_forward_s.READERWRITER) : S
   end
 
   module Nonpersistent : sig
     module Make
         (Flow : Dns_forward_s.FLOW_CLIENT with type address = Ipaddr.t * int)
-        (Framing : Dns_forward_s.READERWRITER with type flow = Flow.flow) : S
+        (Framing : Dns_forward_s.READERWRITER) : S
   end
 end
 
@@ -38,5 +38,5 @@ module Server : sig
 
   module Make
       (Flow : Dns_forward_s.FLOW_SERVER with type address = Ipaddr.t * int)
-      (Framing : Dns_forward_s.READERWRITER with type flow = Flow.flow) : S
+      (Framing : Dns_forward_s.READERWRITER) : S
 end

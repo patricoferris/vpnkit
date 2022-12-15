@@ -118,7 +118,7 @@ let test_local_lookups ~net ~mono ~clock () =
         | _ ->
             None
       in
-      let r = R.create ~local_names_cb ~gen_transaction_id:Random.int config in
+      let r = R.create ~sw ~local_names_cb ~gen_transaction_id:Random.int config in
       let module F = Dns_forward.Server.Make(Rpc)(R) in
       let f = F.create r in
       let port = fresh_port () in
@@ -147,8 +147,8 @@ let test_udp_nonpersistent ~net ~mono ~clock () =
   Alcotest.(check int) "number of connections" 0 (List.length @@ Rpc.get_connections ());
   match
       Eio.Switch.run @@ fun sw ->
-      let module Proto_server = Dns_forward.Rpc.Server.Make(Flow)(Dns_forward.Framing.Udp(Flow)) in
-      let module Proto_client = Dns_forward.Rpc.Client.Nonpersistent.Make(Flow)(Dns_forward.Framing.Udp(Flow)) in
+      let module Proto_server = Dns_forward.Rpc.Server.Make(Flow)(Dns_forward.Framing.Udp) in
+      let module Proto_client = Dns_forward.Rpc.Client.Nonpersistent.Make(Flow)(Dns_forward.Framing.Udp) in
       let module S = Server.Make(Proto_server) in
       let foo_public = "8.8.8.8" in
       (* a public server mapping 'foo' to a public ip *)
@@ -164,7 +164,7 @@ let test_udp_nonpersistent ~net ~mono ~clock () =
           { Server.address = public_address; zones = Domain.Set.empty; timeout_ms = None; order = 0 };
         ] in
       let config = { servers; search = []; assume_offline_after_drops = None } in
-      let r = R.create ~gen_transaction_id:Random.int config in
+      let r = R.create ~sw ~gen_transaction_id:Random.int config in
       let module F = Dns_forward.Server.Make(Proto_server)(R) in
       let f = F.create r in 
       let port = fresh_port () in
@@ -227,8 +227,8 @@ let test_tcp_multiplexing ~net ~mono ~clock () =
   Alcotest.(check int) "number of connections" 0 (List.length @@ Rpc.get_connections ());
   match
       Eio.Switch.run @@ fun sw ->
-      let module Proto_server = Dns_forward.Rpc.Server.Make(Flow)(Dns_forward.Framing.Tcp(Flow)) in
-      let module Proto_client = Dns_forward.Rpc.Client.Persistent.Make(Flow)(Dns_forward.Framing.Tcp(Flow)) in
+      let module Proto_server = Dns_forward.Rpc.Server.Make(Flow)(Dns_forward.Framing.Tcp) in
+      let module Proto_client = Dns_forward.Rpc.Client.Persistent.Make(Flow)(Dns_forward.Framing.Tcp) in
       let module S = Server.Make(Proto_server) in
       let foo_public = "8.8.8.8" in
       (* a public server mapping 'foo' to a public ip *)
@@ -244,7 +244,7 @@ let test_tcp_multiplexing ~net ~mono ~clock () =
           { Server.address = public_address; zones = Domain.Set.empty; timeout_ms = None; order = 0 };
         ] in
       let config = { servers; search = []; assume_offline_after_drops = None } in
-      let r = R.create ~gen_transaction_id:Random.int config in
+      let r = R.create ~sw ~gen_transaction_id:Random.int config in
       let module F = Dns_forward.Server.Make(Proto_server)(R) in
       let f = F.create r in
       let port = fresh_port () in
@@ -307,8 +307,8 @@ let test_good_bad_server ~net ~mono ~clock () =
   Alcotest.(check int) "number of connections" 0 (List.length @@ Rpc.get_connections ());
   match
       Eio.Switch.run @@ fun sw ->
-      let module Proto_server = Dns_forward.Rpc.Server.Make(Flow)(Dns_forward.Framing.Tcp(Flow)) in
-      let module Proto_client = Dns_forward.Rpc.Client.Persistent.Make(Flow)(Dns_forward.Framing.Tcp(Flow)) in
+      let module Proto_server = Dns_forward.Rpc.Server.Make(Flow)(Dns_forward.Framing.Tcp) in
+      let module Proto_client = Dns_forward.Rpc.Client.Persistent.Make(Flow)(Dns_forward.Framing.Tcp) in
       let module S = Server.Make(Proto_server) in
       let foo_public = "8.8.8.8" in
       (* a public server mapping 'foo' to a public ip *)
@@ -333,7 +333,7 @@ let test_good_bad_server ~net ~mono ~clock () =
           { Server.address = bad_address; zones = Domain.Set.empty; timeout_ms = Some 1000; order = 0 };
         ] in
       let config = { servers; search = []; assume_offline_after_drops = None } in
-      let r = R.create ~gen_transaction_id:Random.int config in
+      let r = R.create ~sw ~gen_transaction_id:Random.int config in
       let request = make_a_query (Dns.Name.of_string "foo") in
       let request () =
         R.answer ~sw ~net ~mono ~clock request r
@@ -362,13 +362,13 @@ let test_good_bad_server ~net ~mono ~clock () =
   | Error (`Msg m) -> failwith m
 
 (* One good one dead server should behave like the good server *)
-let test_good_dead_server ~net ~mono ~clock:_ () =
+let test_good_dead_server ~net ~mono ~clock:real_clock () =
   let clock = Fake.Clock.make () in
   Alcotest.(check int) "number of connections" 0 (List.length @@ Rpc.get_connections ());
   match
       Eio.Switch.run @@ fun sw ->
-      let module Proto_server = Dns_forward.Rpc.Server.Make(Flow)(Dns_forward.Framing.Tcp(Flow)) in
-      let module Proto_client = Dns_forward.Rpc.Client.Persistent.Make(Flow)(Dns_forward.Framing.Tcp(Flow)) in
+      let module Proto_server = Dns_forward.Rpc.Server.Make(Flow)(Dns_forward.Framing.Tcp) in
+      let module Proto_client = Dns_forward.Rpc.Client.Persistent.Make(Flow)(Dns_forward.Framing.Tcp) in
       let module S = Server.Make(Proto_server) in
       let foo_public = "8.8.8.8" in
       (* a public server mapping 'foo' to a public ip *)
@@ -395,7 +395,7 @@ let test_good_dead_server ~net ~mono ~clock:_ () =
           { Server.address = bad_address; zones = Domain.Set.empty; timeout_ms = Some 1000; order = 0 };
         ] in
       let config = { servers; search = []; assume_offline_after_drops = Some 1 } in
-      let r = R.create ~gen_transaction_id:Random.int config in
+      let r = R.create ~sw ~gen_transaction_id:Random.int config in
       let request = make_a_query (Dns.Name.of_string "foo") in
       let t = 
         Eio.Fiber.fork_promise ~sw (fun () -> R.answer ~sw ~net ~mono:(mono :> Eio.Time.Mono.t) ~clock:(clock :> Eio.Time.clock) request r)
@@ -415,23 +415,26 @@ let test_good_dead_server ~net ~mono ~clock:_ () =
       (* The bad server should be marked offline and no-one will wait for it *)
       Fake.Clock.reset clock;
       Fake.Clock.advance clock 0.5; (* avoid the timeouts winning the race with the actual result *)
-      let request =
-        match R.answer ~sw ~net ~mono:(mono :> Eio.Time.Mono.t) ~clock:(clock :> Eio.Time.clock) request r with
-        | Ok reply ->
-            let len = Cstruct.length reply in
-            let buf = reply in
-            begin match Dns.Protocol.Server.parse (Cstruct.sub buf 0 len) with
-            | Some { Dns.Packet.answers = _ :: _ ; _ } -> true
-            | Some packet -> failwith ("test_good_dead_server bad response: " ^ (Dns.Packet.to_string packet))
-            | None -> failwith "test_good_dead_server: failed to parse response"
-            end
-        | Error _ -> failwith "test_good_dead_server timeout: did the failure overtake the success?" in
-      let timeout =
-        Eio_unix.sleep 5.;
-        false 
+      let request () =
+        try
+        Eio.Switch.run (fun sw -> 
+          match R.answer ~sw ~net ~mono:(mono :> Eio.Time.Mono.t) ~clock:(clock :> Eio.Time.clock) request r with
+          | Ok reply ->
+              let len = Cstruct.length reply in
+              let buf = reply in
+              begin match Dns.Protocol.Server.parse (Cstruct.sub buf 0 len) with
+              | Some { Dns.Packet.answers = _ :: _ ; _ } -> 
+                Eio.Switch.fail sw Exit;
+                Ok true
+              | Some packet -> failwith ("test_good_dead_server bad response: " ^ (Dns.Packet.to_string packet))
+              | None -> failwith "test_good_dead_server: failed to parse response"
+              end
+          | Error _ -> failwith "test_good_dead_server timeout: did the failure overtake the success?"
+        )
+            with Exit -> Ok true 
       in
-      let ok = Eio.Fiber.first (fun () -> request) (fun () -> timeout) in
-      if not ok then failwith "test_good_dead_server hit timeout";
+      let ok = Eio.Time.with_timeout real_clock 5. request in
+      if ok = Error `Timeout then failwith "test_good_dead_server hit timeout";
       R.destroy r;
       Eio.Switch.fail sw Exit;
       Ok ()
@@ -445,8 +448,8 @@ let test_bad_server ~net ~mono ~clock () =
   Alcotest.(check int) "number of connections" 0 (List.length @@ Rpc.get_connections ());
   match
       Eio.Switch.run @@ fun sw ->
-      let module Proto_server = Dns_forward.Rpc.Server.Make(Flow)(Dns_forward.Framing.Tcp(Flow))in
-      let module Proto_client = Dns_forward.Rpc.Client.Persistent.Make(Flow)(Dns_forward.Framing.Tcp(Flow)) in
+      let module Proto_server = Dns_forward.Rpc.Server.Make(Flow)(Dns_forward.Framing.Tcp)in
+      let module Proto_client = Dns_forward.Rpc.Client.Persistent.Make(Flow)(Dns_forward.Framing.Tcp) in
       let module S = Server.Make(Proto_server) in
       let foo_public = "8.8.8.8" in
       (* a public server mapping 'foo' to a public ip *)
@@ -468,7 +471,7 @@ let test_bad_server ~net ~mono ~clock () =
           { Server.address = bad_address; zones = Domain.Set.empty; timeout_ms = Some 1000; order = 0 };
         ] in
       let config = { servers; search = []; assume_offline_after_drops = None } in
-      let r = R.create ~gen_transaction_id:Random.int config in
+      let r = R.create ~sw ~gen_transaction_id:Random.int config in
       let request = make_a_query (Dns.Name.of_string "foo") in
       let request () =
           Eio.Switch.run @@ fun sw ->
@@ -490,8 +493,8 @@ let test_bad_server ~net ~mono ~clock () =
 
 let test_timeout ~net ~mono ~clock () =
   Alcotest.(check int) "number of connections" 0 (List.length @@ Rpc.get_connections ());
-  let module Proto_server = Dns_forward.Rpc.Server.Make(Flow)(Dns_forward.Framing.Tcp(Flow)) in
-  let module Proto_client = Dns_forward.Rpc.Client.Persistent.Make(Flow)(Dns_forward.Framing.Tcp(Flow)) in
+  let module Proto_server = Dns_forward.Rpc.Server.Make(Flow)(Dns_forward.Framing.Tcp) in
+  let module Proto_client = Dns_forward.Rpc.Client.Persistent.Make(Flow)(Dns_forward.Framing.Tcp) in
   let module S = Server.Make(Proto_server) in
   let foo_public = "8.8.8.8" in
   (* a public server mapping 'foo' to a public ip *)
@@ -511,20 +514,25 @@ let test_timeout ~net ~mono ~clock () =
           { Server.address = bar_address; zones = Domain.Set.empty; timeout_ms = Some 0; order = 0 }
         ] in
       let config = { servers; search = []; assume_offline_after_drops = None } in
-      let r = R.create ~gen_transaction_id:Random.int config in
       let request = make_a_query (Dns.Name.of_string "foo") in
+      let req = ref None in
       let request () =
-        Eio.Switch.run @@ fun sw ->
-        match R.answer ~sw ~net ~mono ~clock request r with
-        | Error _ ->
-          Ok true
-        | Ok _ -> failwith "got a result when timeout expected"
+        try 
+          Eio.Switch.run @@ fun sw ->
+          let r = R.create ~sw ~gen_transaction_id:Random.int config in
+          req := Some r;
+          match R.answer ~sw ~net ~mono ~clock request r with
+          | Error _ ->
+            Eio.Switch.fail sw Exit;
+            Ok true
+          | Ok _ -> failwith "got a result when timeout expected"
+        with Exit -> Ok true
       in
       let timeout = Eio.Time.with_timeout clock 5. request in
       match timeout with
-      | Ok false -> failwith "server timeout was not respected"
-      | Ok true | Error `Timeout ->
-        R.destroy r;
+      | Error `Timeout | Ok false -> failwith "server timeout was not respected"
+      | Ok true ->
+        R.destroy @@ Option.get !req;
         Eio.Switch.fail sw Exit;
         Ok ()
     with
@@ -536,8 +544,8 @@ let test_timeout ~net ~mono ~clock () =
 
 let test_cache ~net ~mono ~clock () =
   Alcotest.(check int) "number of connections" 0 (List.length @@ Rpc.get_connections ());
-  let module Proto_server = Dns_forward.Rpc.Server.Make(Flow)(Dns_forward.Framing.Tcp(Flow)) in
-  let module Proto_client = Dns_forward.Rpc.Client.Persistent.Make(Flow)(Dns_forward.Framing.Tcp(Flow)) in
+  let module Proto_server = Dns_forward.Rpc.Server.Make(Flow)(Dns_forward.Framing.Tcp) in
+  let module Proto_client = Dns_forward.Rpc.Client.Persistent.Make(Flow)(Dns_forward.Framing.Tcp) in
   let module S = Server.Make(Proto_server) in
   let foo_public = "8.8.8.8" in
   (* a public server mapping 'foo' to a public ip *)
@@ -557,7 +565,7 @@ let test_cache ~net ~mono ~clock () =
           { Server.address = bar_address; zones = Domain.Set.empty; timeout_ms = Some 1000; order = 0 }
         ] in
       let config = { servers; search = []; assume_offline_after_drops = None } in
-      let r = R.create ~gen_transaction_id:Random.int config in
+      let r = R.create ~sw ~gen_transaction_id:Random.int config in
       let request = make_a_query (Dns.Name.of_string "foo") in
       match R.answer ~sw ~net ~mono ~clock request r with
       | Error _ -> failwith "failed initial lookup"
@@ -581,8 +589,8 @@ let test_cache ~net ~mono ~clock () =
    slow private server. *)
 let test_order ~net ~mono ~clock () =
   Alcotest.(check int) "number of connections" 0 (List.length @@ Rpc.get_connections ());
-  let module Proto_server = Dns_forward.Rpc.Server.Make(Flow)(Dns_forward.Framing.Tcp(Flow)) in
-  let module Proto_client = Dns_forward.Rpc.Client.Persistent.Make(Flow)(Dns_forward.Framing.Tcp(Flow)) in
+  let module Proto_server = Dns_forward.Rpc.Server.Make(Flow)(Dns_forward.Framing.Tcp) in
+  let module Proto_client = Dns_forward.Rpc.Client.Persistent.Make(Flow)(Dns_forward.Framing.Tcp) in
   let module S = Server.Make(Proto_server) in
   let foo_public = "8.8.8.8" in
   let foo_private = "192.168.1.1" in
@@ -611,7 +619,7 @@ let test_order ~net ~mono ~clock () =
           { Server.address = private_address; zones = Domain.Set.empty; timeout_ms = None; order = 0 }
         ] in
       let config = { servers; search = []; assume_offline_after_drops = None } in
-      let r = R.create ~gen_transaction_id:Random.int config in
+      let r = R.create ~sw ~gen_transaction_id:Random.int config in
       let request = make_a_query (Dns.Name.of_string "foo") in
       let open Error in
       R.answer ~sw ~net ~mono ~clock request r
@@ -661,7 +669,7 @@ let test_forwarder_zone ~net ~mono ~clock () =
           { Server.address = bar_address; zones = Domain.Set.empty; timeout_ms = None; order = 0 }
         ] in
       let config = { servers; search = []; assume_offline_after_drops = None } in
-      let r = R.create ~gen_transaction_id:Random.int config in
+      let r = R.create ~sw ~gen_transaction_id:Random.int config in
       let module F = Dns_forward.Server.Make(Rpc)(R) in
       let f = F.create r in
       let port = fresh_port () in
@@ -708,6 +716,7 @@ let test_protocol_set env = [
 ]
 
 let test_forwarder_set env = [
+  (* This one works but isn't quite right as it is much slower than *)
   "Per-server timeouts", `Quick, (with_env env test_timeout);
   "Zone config respected", `Quick, (with_env env test_forwarder_zone);
   "Local names resolve ok", `Quick, (with_env env test_local_lookups);

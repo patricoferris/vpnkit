@@ -19,11 +19,14 @@
 
 type address = Ipaddr.t * int
 
+type flow
+
 include Dns_forward.Flow.Client
-  with type address := address
+  with type address := address and type flow := flow
 include Dns_forward.Flow.Server
-  with type address := address
-   and type flow := flow
+  with type address := address and type flow := flow
 
 val get_connections: unit -> (address * int) list
 (** Return a list of [server address, number of clients still connected] *)
+
+val of_address : address -> flow

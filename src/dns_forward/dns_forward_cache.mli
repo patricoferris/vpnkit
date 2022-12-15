@@ -18,7 +18,7 @@
 type t
 (** A cache of DNS answers *)
 
-val make : ?max_bindings:int -> unit -> t
+val make : ?max_bindings:int -> sw:Eio.Switch.t -> unit -> t
 (** Create an empty cache. If [?max_bindings] is provided then the cache will
     not contain more than the given number of bindings. *)
 

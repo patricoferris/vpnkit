@@ -38,10 +38,14 @@ module Flow : sig
       on a well-known address (see Server) *)
 
   module type Client = sig
-    include Mirage_flow_combinators.SHUTDOWNABLE
-
     type address
     (** Identifies an endpoint for [connect] *)
+
+    type flow
+    (** An abstract flow *)
+
+    val get_flow : flow -> <Eio.Flow.two_way; Eio.Flow.close> option
+    (** Get the underlying flow, unless closed and removed. *)
 
     val connect :
       sw:Switch.t ->
@@ -66,6 +70,8 @@ module Flow : sig
     (** Query the address the server is bound to *)
 
     type flow
+
+    val get_flow : flow -> <Eio.Flow.two_way; Eio.Flow.close> option
 
     val listen : sw:Eio.Switch.t -> server -> (flow -> unit) -> unit
     (** Accept connections forever, calling the callback with each one.
@@ -92,10 +98,7 @@ module Framing : sig
     type t
     (** A connection which can read and write complete DNS messages *)
 
-    type flow
-    (** The flow over which we read and write complete DNS messages *)
-
-    val connect : flow -> t
+    val connect : <Eio.Flow.two_way; Eio.Flow.close> -> t
     (** Prepare to read and write complete DNS messages over the given flow *)
 
     val read : t -> request Error.t
@@ -109,10 +112,10 @@ module Framing : sig
   end
 
   (** Use TCP framing *)
-  module Tcp (Flow : Mirage_flow.S) : S with type flow = Flow.flow
+  module Tcp : S
 
   (** Use UDP framing *)
-  module Udp (Flow : Mirage_flow.S) : S with type flow = Flow.flow
+  module Udp : S
 end
 
 module Config : sig
@@ -228,7 +231,7 @@ module Rpc : sig
           over the flow. *)
       module Make
           (Flow : Flow.Client with type address = Ipaddr.t * int)
-          (Framing : Framing.S with type flow = Flow.flow) : S
+          (Framing : Framing.S) : S
     end
 
     module Nonpersistent : sig
@@ -236,7 +239,7 @@ module Rpc : sig
           over the flow. *)
       module Make
           (Flow : Flow.Client with type address = Ipaddr.t * int)
-          (Framing : Framing.S with type flow = Flow.flow) : S
+          (Framing : Framing.S) : S
     end
   end
 
@@ -272,7 +275,7 @@ module Rpc : sig
         over the flow. *)
     module Make
         (Flow : Flow.Server with type address = Ipaddr.t * int)
-        (Framing : Framing.S with type flow = Flow.flow) : S
+        (Framing : Framing.S) : S
   end
 end
 
@@ -291,6 +294,7 @@ module Resolver : sig
 
     val create :
       ?local_names_cb:(Dns.Packet.question -> Dns.Packet.rr list option) ->
+      sw:Eio.Switch.t ->
       gen_transaction_id:(int -> int) ->
       ?message_cb:message_cb ->
       Config.t ->

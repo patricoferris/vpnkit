@@ -14,6 +14,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  *)
+open Eio
 
 let src =
   let src = Logs.Src.create "Dns_forward" ~doc:"DNS over SOCKETS" in
@@ -30,7 +31,7 @@ module Client = struct
   module Nonpersistent = struct
     module Make
         (Sockets : Dns_forward_s.FLOW_CLIENT with type address = Ipaddr.t * int)
-        (Packet : Dns_forward_s.READERWRITER with type flow = Sockets.flow) =
+        (Packet : Dns_forward_s.READERWRITER) =
     struct
       type address = Dns_forward_config.Address.t
       type request = Cstruct.t
@@ -79,7 +80,6 @@ module Client = struct
                 Log.debug (fun f ->
                     f "%s mapping DNS id %d -> %d" (to_string t) client_id
                       free_id);
-
                 match
                   Sockets.connect ~sw ~net
                     ( t.address.Dns_forward_config.Address.ip,
@@ -89,19 +89,18 @@ module Client = struct
                 | Ok flow ->
                     Fun.protect
                       (fun () ->
-                        let rw = Packet.connect flow in
+                        let rw = Packet.connect (Option.get @@ Sockets.get_flow flow) in
                         t.message_cb ~dst:t.address ~buf:buffer ();
 
                         (* An existing connection to the server might have been closed by the server;
                            therefore if we fail to write the request, reconnect and try once more. *)
                         Packet.write rw buffer >>= fun () ->
                         Packet.read rw >>= fun buf ->
-                        Logs.debug (fun f -> f "READ");
                         t.message_cb ~src:t.address ~buf ();
                         (* Rewrite the query id back to the original *)
                         Cstruct.BE.set_uint16 buf 0 client_id;
                         Ok buf)
-                      ~finally:(fun () -> Sockets.close flow))
+                      ~finally:(fun () -> Option.iter Flow.close (Sockets.get_flow flow)))
         | _ ->
             Log.err (fun f ->
                 f "%s: rpc: failed to parse request" (to_string t));
@@ -114,7 +113,7 @@ module Client = struct
   module Persistent = struct
     module Make
         (Sockets : Dns_forward_s.FLOW_CLIENT with type address = Ipaddr.t * int)
-        (Packet : Dns_forward_s.READERWRITER with type flow = Sockets.flow) =
+        (Packet : Dns_forward_s.READERWRITER) =
     struct
       open Eio
 
@@ -139,12 +138,10 @@ module Client = struct
         message_cb : message_cb;
       }
 
-      module FlowError = Dns_forward_error.FromFlowError (Sockets)
-
       let to_string t = Dns_forward_config.Address.to_string t.client_address
 
       let disconnect t =
-        Mutex.use_ro t.m (fun () ->
+        Mutex.use_rw ~protect:false t.m (fun () ->
             match t with
             | { rw = Some rw; _ } as t ->
                 t.rw <- None;
@@ -174,7 +171,6 @@ module Client = struct
          is closed, `read_buffer` will fail and this thread will exit. *)
       let dispatcher t rw () =
         let rec loop () =
-          Logs.debug (fun f -> f "Looping in the dispatcher");
           match Packet.read rw with
           | Error (`Msg m) ->
               Log.debug (fun f ->
@@ -185,7 +181,6 @@ module Client = struct
                 f "%s: dispatcher shutting down: %s" (to_string t) (Printexc.to_string e));
             disconnect t
           | Ok buffer -> (
-              Logs.debug (fun f -> f "Got buffer");
               let buf = buffer in
               match
                 Dns.Protocol.Server.parse
@@ -236,21 +231,18 @@ module Client = struct
           Mutex.use_ro t.m (fun () ->
               match t.rw with
               | None ->
-                  Logs.debug (fun f -> f "Trying to connect");
                   Sockets.connect ~sw ~net
                     ( t.address.Dns_forward_config.Address.ip,
                       t.address.Dns_forward_config.Address.port )
                   >>= fun flow ->
-                  let rw = Packet.connect flow in
+                  let rw = Packet.connect @@ Option.get @@ Sockets.get_flow flow in
                   t.rw <- Some rw;
                   Fiber.fork ~sw (dispatcher t rw);
-                  Logs.debug (fun f -> f "Trying to connected");
                   Ok rw
               | Some rw -> Ok rw)
         in
         (* Add a fresh idle timer *)
         t.disconnect_on_idle <- (Fiber.fork_promise ~sw (fun () -> Time.sleep clock 30.; disconnect t));
-        Logs.debug (fun f -> f "Returning");
         rw
 
       let connect ~gen_transaction_id
@@ -307,14 +299,12 @@ module Client = struct
                     Log.debug (fun f ->
                         f "%s mapping DNS id %d -> %d" (to_string t) client_id
                           free_id);
-
                     let th, u = Promise.create () in
                     Hashtbl.replace t.wakeners free_id (question, u);
 
                     (* If we fail to connect, return the error *)
                     let v =
                       get_rw ~sw clock net t >>= fun rw ->
-                      Logs.debug (fun f -> f "RAWFEWDFW");
                       t.message_cb ~dst:t.address ~buf:buffer ();
                       (* An existing connection to the server might have been closed by the server;
                          therefore if we fail to write the request, reconnect and try once more. *)
@@ -358,7 +348,7 @@ module Server = struct
 
   module Make
       (Sockets : Dns_forward_s.FLOW_SERVER with type address = Ipaddr.t * int)
-      (Packet : Dns_forward_s.READERWRITER with type flow = Sockets.flow) =
+      (Packet : Dns_forward_s.READERWRITER) =
   struct
     open Eio
 
@@ -375,7 +365,8 @@ module Server = struct
 
     let listen ~sw { server; _ } cb =
       Sockets.listen ~sw server (fun flow ->
-          let rw = Packet.connect flow in
+          let underlying_flow = Option.get @@ Sockets.get_flow flow in
+          let rw = Packet.connect underlying_flow in
           let rec loop () =
             Packet.read rw >>= fun request ->
             Fiber.fork ~sw (fun () ->

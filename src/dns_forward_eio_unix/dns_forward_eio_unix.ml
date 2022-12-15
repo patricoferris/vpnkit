@@ -30,11 +30,7 @@ let max_udp_length = 65507
 module Common = struct
   (** Both UDP and TCP *)
 
-  type error = [ `Msg of string ]
-  type write_error = Mirage_flow.write_error
-
   let pp_error ppf (`Msg x) = Fmt.string ppf x
-  let pp_write_error = Mirage_flow.pp_write_error
   let errorf fmt = Printf.ksprintf (fun s -> Error (`Msg s)) fmt
 
   type address = Ipaddr.t * int
@@ -64,9 +60,11 @@ module Tcp = struct
   type flow = {
     read_buffer_size : int;
     mutable read_buffer : Cstruct.t;
-    mutable flow : < Flow.two_way > option;
+    mutable flow : < Flow.two_way; Flow.close > option;
     address : address;
   }
+
+  let get_flow flow = flow.flow
 
   let of_flow ~read_buffer_size address flow =
     let read_buffer = Cstruct.create read_buffer_size in
@@ -81,7 +79,7 @@ module Tcp = struct
     let sockaddr = `Tcp (sockaddr_of_address address) in
     try
       let flow = Net.connect ~sw net sockaddr in
-      Ok (of_flow ~read_buffer_size address (flow :> Flow.two_way))
+      Ok (of_flow ~read_buffer_size address flow)
     with e ->
       errorf "%s: Net.connect: caught %s" description (Printexc.to_string e)
 
@@ -194,6 +192,14 @@ module Tcp = struct
           port )
     | _ -> failwith "Unknown incoming socket address!"
 
+  let close_noop (flow : Flow.two_way) = object
+    inherit Flow.two_way
+    method read_into = flow#read_into
+    method shutdown = flow#shutdown
+    method copy = flow#copy
+    method close = ()
+  end
+
   let listen ~sw (server : server) cb =
     let rec loop sock =
       Net.accept_fork ~sw sock
@@ -201,7 +207,7 @@ module Tcp = struct
         (fun client sockaddr ->
           let read_buffer_size = server.read_buffer_size in
           let addr = addr_of_sockaddr sockaddr in
-          let flow = of_flow ~read_buffer_size addr client in
+          let flow = of_flow ~read_buffer_size addr (close_noop client) in
           Fun.protect
             (fun () ->
               try cb flow
@@ -239,6 +245,9 @@ module Udp = struct
     sockaddr : Net.Ipaddr.v4v6 * int;
     address : address;
   }
+
+  (* Wrap datagram? *)
+  let get_flow _ = None
 
   let string_of_flow t =
     Printf.sprintf "udp -> %s" (string_of_address t.address)
@@ -381,17 +390,17 @@ end
 
 module R = struct
   open Dns_forward
-  module Udp_client = Rpc.Client.Nonpersistent.Make (Udp) (Framing.Udp (Udp))
+  module Udp_client = Rpc.Client.Nonpersistent.Make (Udp) (Framing.Udp)
   module Udp = Resolver.Make (Udp_client)
-  module Tcp_client = Rpc.Client.Persistent.Make (Tcp) (Framing.Tcp (Tcp))
+  module Tcp_client = Rpc.Client.Persistent.Make (Tcp) (Framing.Tcp)
   module Tcp = Resolver.Make (Tcp_client)
 end
 
 module Server = struct
   open Dns_forward
-  module Udp_server = Rpc.Server.Make (Udp) (Framing.Udp (Udp))
+  module Udp_server = Rpc.Server.Make (Udp) (Framing.Udp)
   module Udp = Server.Make (Udp_server) (R.Udp)
-  module Tcp_server = Rpc.Server.Make (Tcp) (Framing.Tcp (Tcp))
+  module Tcp_server = Rpc.Server.Make (Tcp) (Framing.Tcp)
   module Tcp = Server.Make (Tcp_server) (R.Tcp)
 end
 

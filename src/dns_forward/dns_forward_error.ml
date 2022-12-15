@@ -22,11 +22,3 @@ let errorf fmt = Fmt.kstr (fun s -> Error (`Msg s)) fmt
 module Infix = struct
   let ( >>= ) = Result.bind
 end
-
-module FromFlowError (Flow : Mirage_flow.S) = struct
-  let ( >>= ) m f =
-    match m with
-    | `Eof -> errorf "Unexpected end of file"
-    | `Error e -> errorf "%a" Flow.pp_error e
-    | `Ok x -> f x
-end

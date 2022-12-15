@@ -14,6 +14,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  *)
+open Eio
 
 let src =
   let src = Logs.Src.create "Dns_forward" ~doc:"DNS framing" in
@@ -24,77 +25,74 @@ module Log = (val Logs.src_log src : Logs.LOG)
 
 module type S = Dns_forward_s.READERWRITER
 
-module Tcp (Flow : Mirage_flow.S) = struct
+module Tcp = struct
   let errorf = Dns_forward_error.errorf
-
-  module C = Mirage_channel.Make (Flow)
 
   type request = Cstruct.t
   type response = Cstruct.t
-  type flow = Flow.flow
-  type t = { c : C.t; write_m : Eio.Mutex.t; read_m : Eio.Mutex.t }
+  type flow = <Flow.two_way; Flow.close>
+  type t = { flow : flow; buf : Eio.Buf_read.t; write_m : Eio.Mutex.t; read_m : Eio.Mutex.t }
 
   let connect flow =
-    let c = C.create flow in
     let write_m = Eio.Mutex.create () in
     let read_m = Eio.Mutex.create () in
-    { c; write_m; read_m }
+    let buf = Eio.Buf_read.of_flow ~max_size:max_int flow in
+    { flow; write_m; read_m; buf }
 
-  let close t = Flow.close @@ C.to_flow t.c
+  let close t = Flow.close t.flow
 
   let read t =
     Eio.Mutex.use_rw ~protect:false t.read_m (fun () ->
-       Logs.debug (fun f -> f "Reading!");
-        match C.read_exactly ~len:2 t.c with
-        | Error e -> errorf "Failed to read response header: %a" C.pp_error e
-        | Ok `Eof -> errorf "Got EOF while reading the response header"
-        | Ok (`Data bufs) -> (
-            Logs.debug (fun f -> f "HERE");
-            let buf = Cstruct.concat bufs in
-            let len = Cstruct.BE.get_uint16 buf 0 in
-            match C.read_exactly ~len t.c with
-            | Error e ->
-                errorf "Failed to read response payload (%d bytes): %a" len
-                  C.pp_error e
-            | Ok `Eof -> errorf "Got EOF while reading the response payload"
-            | Ok (`Data bufs) -> Ok (Cstruct.concat bufs)))
+        try
+          let buf = Cstruct.create 2 in 
+          Flow.read_exact t.flow buf;
+          let len = Cstruct.BE.get_uint16 buf 0 in
+          let data = Cstruct.create len in
+          Flow.read_exact t.flow data;
+          Ok data
+        with
+          | End_of_file -> errorf "Got EOF while reading the response header"
+          | e -> errorf "Reading %a" Fmt.exn e
+    )
 
   let write t buffer =
-    Logs.debug (fun f -> f "WR");
     Eio.Mutex.use_rw ~protect:false t.write_m (fun () ->
         (* RFC 1035 4.2.2 TCP Usage: 2 byte length field *)
-        let header = Cstruct.create 2 in
-        Cstruct.BE.set_uint16 header 0 (Cstruct.length buffer);
-        C.write_buffer t.c header;
-        C.write_buffer t.c buffer;
-        C.flush t.c |> function
-        | Ok () -> Ok ()
-        | Error e ->
+        try
+          let header = Cstruct.create 2 in
+          Cstruct.BE.set_uint16 header 0 (Cstruct.length buffer);
+          Flow.write t.flow [ header; buffer ];
+          Ok ()
+        with
+        | e ->
             errorf "Failed to write %d bytes: %a" (Cstruct.length buffer)
-              C.pp_write_error e)
+              Fmt.exn e)
 end
 
-module Udp (Flow : Mirage_flow.S) = struct
+module Udp = struct
   module Error = Dns_forward_error.Infix
 
   let errorf = Dns_forward_error.errorf
 
   type request = Cstruct.t
   type response = Cstruct.t
-  type flow = Flow.flow
-  type t = Flow.flow
+  type flow = <Flow.two_way; Flow.close>
+  type t = flow
 
   let connect flow = flow
   let close t = Flow.close t
 
+  (* TODO: Is this a hack for handling datagrams as flows?! *)
   let read t =
-    match Flow.read t with
-    | Ok (`Data buf) -> Ok buf
-    | Ok `Eof -> errorf "read: Eof"
-    | Error e -> errorf "read: %a" Flow.pp_error e
+    let buf = Cstruct.create 65507 in
+    try 
+      let i = Flow.single_read t buf in
+      Ok (Cstruct.sub buf 0 i)
+    with
+    | End_of_file -> errorf "read: Eof"
+    | exn -> errorf "read: %a" Exn.pp exn
 
-  let write t buf =
-    match Flow.write t buf with
-    | Ok () -> Ok ()
-    | Error e -> errorf "write: %a" Flow.pp_write_error e
+  let write (t : flow) buf =
+    Flow.write t [ buf ];
+    Ok ()
 end

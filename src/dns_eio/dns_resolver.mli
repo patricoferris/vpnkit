@@ -52,7 +52,7 @@ val resolve_pkt :
     {!Dns.Protocol.Dns_resolve_error} exception which contains a list
     of all of the errors encountered during resolution. *)
 
-val resolve : 
+  val resolve :
   (module Dns.Protocol.CLIENT) ->
   ?alloc:(unit -> Cstruct.t) ->
   ?dnssec:bool ->
