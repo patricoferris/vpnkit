@@ -14,6 +14,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  *)
+open Eio
 
 module type Comparable = sig
   type t
@@ -24,16 +25,12 @@ end
 module type FLOW_CLIENT = sig
   type address
 
-  type flow
-
-  val get_flow : flow -> <Eio.Flow.two_way; Eio.Flow.close> option
-
   val connect :
     sw:Eio.Switch.t ->
     net:Eio.Net.t ->
     ?read_buffer_size:int ->
     address ->
-    (flow, [ `Msg of string ]) result
+    (<Iflow.rw; Flow.two_way; Flow.close>, [ `Msg of string ]) result
 end
 
 module type FLOW_SERVER = sig
@@ -49,11 +46,7 @@ module type FLOW_SERVER = sig
 
   val getsockname : server -> address
 
-  type flow
-
-  val get_flow : flow -> <Eio.Flow.two_way; Eio.Flow.close> option
-
-  val listen : sw:Eio.Switch.t -> server -> (flow -> unit) -> unit
+  val listen : sw:Eio.Switch.t -> server -> (<Iflow.rw; Flow.two_way; Flow.close> -> unit) -> unit
   val shutdown : server -> unit
 end
 
@@ -156,7 +149,7 @@ module type READERWRITER = sig
   type response = Cstruct.t
   type t
 
-  val connect : <Eio.Flow.two_way; Eio.Flow.close> -> t
+  val connect : <Iflow.rw; Eio.Flow.two_way; Eio.Flow.close> -> t
   val read : t -> (request, [ `Msg of string ]) result
   val write : t -> response -> (unit, [ `Msg of string ]) result
   val close : t -> unit

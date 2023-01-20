@@ -30,21 +30,20 @@ module Tcp = struct
 
   type request = Cstruct.t
   type response = Cstruct.t
-  type flow = <Flow.two_way; Flow.close>
-  type t = { flow : flow; buf : Eio.Buf_read.t; write_m : Eio.Mutex.t; read_m : Eio.Mutex.t }
+  type flow = <Iflow.rw; Flow.two_way; Flow.close>
+  type t = { flow : flow; write_m : Eio.Mutex.t; read_m : Eio.Mutex.t }
 
   let connect flow =
     let write_m = Eio.Mutex.create () in
     let read_m = Eio.Mutex.create () in
-    let buf = Eio.Buf_read.of_flow ~max_size:max_int flow in
-    { flow; write_m; read_m; buf }
+    { flow; write_m; read_m }
 
   let close t = Flow.close t.flow
 
   let read t =
     Eio.Mutex.use_rw ~protect:false t.read_m (fun () ->
         try
-          let buf = Cstruct.create 2 in 
+          let buf = Cstruct.create 2 in
           Flow.read_exact t.flow buf;
           let len = Cstruct.BE.get_uint16 buf 0 in
           let data = Cstruct.create len in
@@ -76,7 +75,7 @@ module Udp = struct
 
   type request = Cstruct.t
   type response = Cstruct.t
-  type flow = <Flow.two_way; Flow.close>
+  type flow = <Iflow.rw; Flow.two_way; Flow.close>
   type t = flow
 
   let connect flow = flow
@@ -85,7 +84,7 @@ module Udp = struct
   (* TODO: Is this a hack for handling datagrams as flows?! *)
   let read t =
     let buf = Cstruct.create 65507 in
-    try 
+    try
       let i = Flow.single_read t buf in
       Ok (Cstruct.sub buf 0 i)
     with

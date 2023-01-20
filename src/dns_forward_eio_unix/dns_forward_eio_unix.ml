@@ -29,8 +29,6 @@ let max_udp_length = 65507
 
 module Common = struct
   (** Both UDP and TCP *)
-
-  let pp_error ppf (`Msg x) = Fmt.string ppf x
   let errorf fmt = Printf.ksprintf (fun s -> Error (`Msg s)) fmt
 
   type address = Ipaddr.t * int
@@ -57,21 +55,45 @@ end
 module Tcp = struct
   include Common
 
-  type flow = {
-    read_buffer_size : int;
-    mutable read_buffer : Cstruct.t;
-    mutable flow : < Flow.two_way; Flow.close > option;
-    address : address;
-  }
+  let of_flow ~read_buffer_size address flow = object
+    inherit Flow.two_way
 
-  let get_flow flow = flow.flow
+    val address = address
 
-  let of_flow ~read_buffer_size address flow =
-    let read_buffer = Cstruct.create read_buffer_size in
-    { flow = Some flow; read_buffer_size; read_buffer; address }
+    method address = address
+
+    method shutdown = Flow.shutdown flow
+    method copy src = Flow.copy src flow
+    method read_into = flow#read_into
+
+    method close = Flow.close flow
+
+    val read_buffer_size = read_buffer_size
+    val mutable read_buffer = Cstruct.empty
+
+    method read =
+    if Cstruct.length read_buffer = 0 then
+      read_buffer <- Cstruct.create read_buffer_size;
+    let got = Flow.single_read flow read_buffer in
+    let results = Cstruct.sub read_buffer 0 got in
+    read_buffer <- Cstruct.shift read_buffer got;
+    results
+  end
 
   let string_of_flow flow =
-    Printf.sprintf "tcp -> %s" (string_of_address flow.address)
+    Printf.sprintf "tcp -> %s" (string_of_address flow#address)
+
+  (* let writev flow bufs =
+    try
+      Flow.write flow bufs;
+      Ok ()
+    with
+    | Exn.Io (Net.E (Net.Connection_reset _), _) -> Error `Closed
+    | e ->
+        Log.err (fun f ->
+            f "%s: write caught %s returning Eof" (string_of_flow flow)
+              (Printexc.to_string e));
+        Error `Closed *)
 
   let connect ~sw ~net ?(read_buffer_size = default_read_buffer_size) address =
     let description = Printf.sprintf "tcp -> %s" (string_of_address address) in
@@ -79,71 +101,14 @@ module Tcp = struct
     let sockaddr = `Tcp (sockaddr_of_address address) in
     try
       let flow = Net.connect ~sw net sockaddr in
-      Ok (of_flow ~read_buffer_size address flow)
+      Ok (of_flow ~read_buffer_size address flow :> <Iflow.rw; Flow.two_way; Flow.close>)
     with e ->
       errorf "%s: Net.connect: caught %s" description (Printexc.to_string e)
 
-  let read t =
-    match t.flow with
-    | None -> Ok `Eof
-    | Some flow -> (
-        if Cstruct.length t.read_buffer = 0 then
-          t.read_buffer <- Cstruct.create t.read_buffer_size;
-        try
-          let got = Flow.single_read flow t.read_buffer in
-          let results = Cstruct.sub t.read_buffer 0 got in
-          t.read_buffer <- Cstruct.shift t.read_buffer got;
-          Ok (`Data results)
-        with End_of_file -> Ok `Eof)
-
-  let writev t bufs =
-    match t.flow with
-    | None -> Error `Closed
-    | Some flow -> (
-        try
-          Flow.write flow bufs;
-          Ok ()
-        with
-        | Exn.Io (Net.E (Net.Connection_reset _), _) -> Error `Closed
-        | e ->
-            Log.err (fun f ->
-                f "%s: write caught %s returning Eof" (string_of_flow t)
-                  (Printexc.to_string e));
-            Error `Closed)
-
-  let write t buf = writev t [ buf ]
-
   let close t =
-    match t.flow with
-    | None -> ()
-    | Some _flow ->
-        t.flow <- None;
-        Log.debug (fun f -> f "%s: Tcp.close" (string_of_flow t))
+    Flow.close (t :> Flow.close);
+    Log.debug (fun f -> f "%s: Tcp.close" (string_of_flow t))
   (* Eio should handle this ? Flow.close flow *)
-
-  let shutdown_read t =
-    match t.flow with
-    | None -> ()
-    | Some flow -> (
-        try Flow.shutdown flow `Receive
-        with
-        (* | Unix.Unix_error (Unix.ENOTCONN, _, _) -> Lwt.return_unit *)
-        | e ->
-          Log.err (fun f ->
-              f "%s: Flow.shutdown receive caught %s" (string_of_flow t)
-                (Printexc.to_string e)))
-
-  let shutdown_write t =
-    match t.flow with
-    | None -> ()
-    | Some flow -> (
-        try Flow.shutdown flow `Send
-        with
-        (* | Unix.Unix_error(Unix.ENOTCONN, _, _) -> Lwt.return_unit *)
-        | e ->
-          Log.err (fun f ->
-              f "%s: Lwt_unix.shutdown send caught %s" (string_of_flow t)
-                (Printexc.to_string e)))
 
   type server = {
     mutable flow : Net.listening_socket option;
@@ -210,7 +175,7 @@ module Tcp = struct
           let flow = of_flow ~read_buffer_size addr (close_noop client) in
           Fun.protect
             (fun () ->
-              try cb flow
+              try cb (flow :> <Iflow.rw; Flow.two_way; Flow.close>)
               with e ->
                 Log.info (fun f ->
                     f "tcp:%s <- %a: caught %s so closing flow"
@@ -238,7 +203,7 @@ end
 module Udp = struct
   include Common
 
-  type flow = {
+  type flow_state = {
     mutable dgram : < Net.datagram_socket > option;
     read_buffer_size : int;
     mutable already_read : Cstruct.t option;
@@ -246,51 +211,31 @@ module Udp = struct
     address : address;
   }
 
-  (* Wrap datagram? *)
-  let get_flow _ = None
-
   let string_of_flow t =
     Printf.sprintf "udp -> %s" (string_of_address t.address)
 
-  let of_dgram ?(read_buffer_size = max_udp_length) ?(already_read = None)
-      sockaddr address d =
-    { dgram = Some d; read_buffer_size; already_read; sockaddr; address }
-
-  let connect ~sw ~net ?read_buffer_size address =
-    Log.debug (fun f -> f "udp -> %s: connect" (string_of_address address));
-    (* Win32 requires all sockets to be bound however macOS and Linux don't *)
-    let dgram = Net.datagram_socket ~sw net (`Udp (Net.Ipaddr.V4.any, 0)) in
-    (* Lwt.catch (fun () ->
-           Lwt_unix.bind fd (Lwt_unix.ADDR_INET(Unix.inet_addr_any, 0))
-         ) (fun _ -> Lwt.return ())
-       >|= fun () -> *)
-    let sockaddr = sockaddr_of_address address in
-    Ok
-      (of_dgram ?read_buffer_size sockaddr address
-         (dgram :> Net.datagram_socket))
-
   let read t =
     match (t.dgram, t.already_read) with
-    | None, _ -> Ok `Eof
+    | None, _ -> raise End_of_file
     | Some _, Some data when Cstruct.length data > 0 ->
         t.already_read <- Some (Cstruct.sub data 0 0);
         (* next read is `Eof *)
-        Ok (`Data data)
-    | Some _, Some _ -> Ok `Eof
+        data
+    | Some _, Some _ -> raise End_of_file
     | Some dgram, None -> (
         let buffer = Cstruct.create t.read_buffer_size in
         try
           (* Lwt on Win32 doesn't support Lwt_bytes.recvfrom *)
           let _from, n = Net.recv dgram buffer in
           let response = Cstruct.sub buffer 0 n in
-          Ok (`Data response)
+          response
         with e ->
           Log.err (fun f ->
               f "%s: recvfrom caught %s returning Eof" (string_of_flow t)
                 (Printexc.to_string e));
-          Ok `Eof)
+          raise End_of_file)
 
-  let write t buf =
+  (* let write t buf =
     match t.dgram with
     | None -> Error `Closed
     | Some d -> (
@@ -302,20 +247,9 @@ module Udp = struct
           Log.err (fun f ->
               f "%s: sendto caught %s returning Eof" (string_of_flow t)
                 (Printexc.to_string e));
-          Error `Closed)
+          Error `Closed) *)
 
-  let writev t bufs = write t (Cstruct.concat bufs)
-
-  let close t =
-    match t.dgram with
-    | None -> ()
-    | Some _fd ->
-        t.dgram <- None;
-        Log.debug (fun f -> f "%s: close" (string_of_flow t))
-  (* Lwt_unix.close fd *)
-
-  let shutdown_read _t = ()
-  let shutdown_write _t = ()
+  (* let writev t bufs = write t (Cstruct.concat bufs) *)
 
   type server = {
     mutable server : < Net.datagram_socket > option;
@@ -345,6 +279,40 @@ module Udp = struct
         t.server <- None;
         Log.debug (fun f -> f "%s: close" (string_of_server t))
   (* Lwt_unix.close fd *)
+
+  let of_dgram ?(read_buffer_size = max_udp_length) ?(already_read = None)
+  sockaddr address d =
+    let state = { dgram = Some d; read_buffer_size; already_read; sockaddr; address } in
+    object
+      inherit Flow.two_way
+      inherit Iflow.r
+
+      val state = state
+
+      method copy = failwith "Not implemented... yet?"
+
+      method read = read state
+
+      method read_into buf =
+        let r = read state in
+        let len = min (Cstruct.length buf) (Cstruct.length r) in
+        Cstruct.blit r 0 buf 0 len;
+        len
+
+      (* method read_methods = [] *)
+
+      method shutdown _ = ()
+      method close = ()
+    end
+
+  let connect ~sw ~net ?read_buffer_size address =
+  Log.debug (fun f -> f "udp -> %s: connect" (string_of_address address));
+  (* Win32 requires all sockets to be bound however macOS and Linux don't *)
+  let dgram = Net.datagram_socket ~sw net (`Udp (Net.Ipaddr.V4.any, 0)) in
+  let sockaddr = sockaddr_of_address address in
+  Ok
+    (of_dgram ?read_buffer_size sockaddr address
+      (dgram :> Net.datagram_socket) :> <Iflow.rw; Flow.two_way; Flow.close>)
 
   let listen ~sw t flow_cb =
     let buffer = Cstruct.create max_udp_length in

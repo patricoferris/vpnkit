@@ -22,8 +22,6 @@ let errorf fmt = Printf.ksprintf (fun s -> Result.Error (`Msg s)) fmt
 
 type address = Ipaddr.t * int
 let string_of_address (ip, port) = Ipaddr.to_string ip ^ ":" ^ (string_of_int port)
-type error = [ `Msg of string ]
-let pp_error ppf (`Msg x) = Fmt.string ppf x
 
 type inner_flow = {
   l2r: Cstruct.t Lwt_dllist.t; (* pending data from left to right *)
@@ -40,12 +38,11 @@ type inner_flow = {
 }
 
 type flow = <
+  Iflow.rw;
   Eio.Flow.two_way;
   Eio.Flow.close;
   expose : inner_flow
 >
-
-let get_flow t = Some (t :> <Eio.Flow.two_way; Eio.Flow.close>)
 
 let openflow server_address =
   let l2r = Lwt_dllist.create () in
@@ -65,22 +62,6 @@ let otherend flow =
     l2r_m = flow.l2r_m; r2l_m = flow.r2l_m;
     client_address = flow.server_address; server_address = flow.client_address; unread = flow.unread }
 
-let read flow =
-  let rec wait () =
-    if Lwt_dllist.is_empty flow.r2l && not(flow.r2l_closed) then begin
-      Eio.Condition.await_no_mutex flow.r2l_c;
-      wait ()
-    end else () in
-  wait ();
-  if flow.r2l_closed
-  then begin
-    Ok `Eof
-  end
-  else begin
-    let d = Lwt_dllist.take_r flow.r2l in
-    Ok (`Data d)
-  end 
-
 let write flow buf =
   if flow.l2r_closed then Error `Closed else (
     ignore @@ Lwt_dllist.add_l buf flow.l2r;
@@ -95,13 +76,6 @@ let shutdown_read flow =
 let shutdown_write flow =
   flow.l2r_closed <- true;
   Eio.Condition.signal flow.l2r_c
-
-let writev flow bufs =
-  if flow.l2r_closed then Error `Closed else (
-    List.iter (fun buf -> ignore @@ Lwt_dllist.add_l buf flow.l2r) bufs;
-    Eio.Condition.signal flow.l2r_c;
-    Ok ()
-  )
 
 let nr_connects = Hashtbl.create 7
 
@@ -131,6 +105,22 @@ let make t =
 
     method close = close t
 
+    method read =
+      let rec wait () =
+        if Lwt_dllist.is_empty t.r2l && not (t.r2l_closed) then begin
+          Eio.Condition.await_no_mutex t.r2l_c;
+          wait ()
+        end else () in
+      wait ();
+      if t.r2l_closed
+      then begin
+        raise End_of_file
+      end
+      else begin
+        let d = Lwt_dllist.take_r t.r2l in
+        d
+      end
+
     (* Because of the already existing API, I've added this
        strange workaround to mimic how the old reading worked
        by storing unread data. *)
@@ -143,31 +133,28 @@ let make t =
           (if size >= unread_size then t.unread <- None else t.unread <- Some (Cstruct.sub buf size (unread_size - size)));
           Cstruct.blit buf 0 v 0 (min unread_size size);
           min unread_size size
-      | None -> 
-        match read t with
-        | Ok (`Data buf) ->
-          let unread_size = Cstruct.length buf in
-          let size = Cstruct.length v in
-          (if size >= unread_size then t.unread <- None else t.unread <- Some (Cstruct.sub buf size (unread_size - size)));
-          Cstruct.blit buf 0 v 0 (min unread_size size);
-          min unread_size size
-        | Ok `Eof -> raise End_of_file
-        | Error _ -> failwith "Error"
+      | None ->
+        let buf = self#read in
+        let unread_size = Cstruct.length buf in
+        let size = Cstruct.length v in
+        (if size >= unread_size then t.unread <- None else t.unread <- Some (Cstruct.sub buf size (unread_size - size)));
+        Cstruct.blit buf 0 v 0 (min unread_size size);
+        min unread_size size
 
-    method write buf = 
+    method !write buf =
       match write t (Cstruct.concat buf) with
       | Ok () -> ()
       | Error `Closed -> failwith "Closed!"
 
     (* For now we rely on not copying data *)
-    method copy src = assert false
+    method copy _src = assert false
 
     method shutdown = function
       | `Send -> shutdown_write t
       | `Receive -> shutdown_read t
       | `All ->
         shutdown_read t;
-        shutdown_write t 
+        shutdown_write t
   end
 
 let of_address address =
@@ -183,7 +170,7 @@ let connect ~sw:_ ~net:_ ?read_buffer_size:_ address =
     Hashtbl.replace nr_connects address (if Hashtbl.mem nr_connects address then Hashtbl.find nr_connects address + 1 else 1);
     let cb = (Hashtbl.find bound address).listen_cb in
     let flow = cb () in
-    flow
+    (flow :> (<Eio.Flow.two_way; Iflow.rw; Eio.Flow.close>, [`Msg of string]) result)
   end else errorf "connect: no server bound to %s" (string_of_address address)
 
 let bind ~sw:_ _net address =
@@ -201,7 +188,7 @@ let listen ~sw server cb =
     Eio.Fiber.fork ~sw
       (fun () ->
          try
-          cb (otherend flow)
+          cb (otherend flow :> <Iflow.rw; Eio.Flow.two_way; Eio.Flow.close>)
          with _e -> ()
       );
     Result.Ok flow in

@@ -41,18 +41,12 @@ module Flow : sig
     type address
     (** Identifies an endpoint for [connect] *)
 
-    type flow
-    (** An abstract flow *)
-
-    val get_flow : flow -> <Eio.Flow.two_way; Eio.Flow.close> option
-    (** Get the underlying flow, unless closed and removed. *)
-
     val connect :
       sw:Switch.t ->
       net:Net.t ->
       ?read_buffer_size:int ->
       address ->
-      flow Error.t
+      <Iflow.rw; Eio.Flow.two_way; Eio.Flow.close> Error.t
     (** [connect address] creates a connection to [address] and returns
         the connected flow. *)
   end
@@ -69,11 +63,7 @@ module Flow : sig
     val getsockname : server -> address
     (** Query the address the server is bound to *)
 
-    type flow
-
-    val get_flow : flow -> <Eio.Flow.two_way; Eio.Flow.close> option
-
-    val listen : sw:Eio.Switch.t -> server -> (flow -> unit) -> unit
+    val listen : sw:Eio.Switch.t -> server -> (<Iflow.rw; Eio.Flow.two_way; Eio.Flow.close> -> unit) -> unit
     (** Accept connections forever, calling the callback with each one.
         Connections are closed automatically when the callback finishes. *)
 
@@ -98,7 +88,7 @@ module Framing : sig
     type t
     (** A connection which can read and write complete DNS messages *)
 
-    val connect : <Eio.Flow.two_way; Eio.Flow.close> -> t
+    val connect : <Iflow.rw; Eio.Flow.two_way; Eio.Flow.close> -> t
     (** Prepare to read and write complete DNS messages over the given flow *)
 
     val read : t -> request Error.t

@@ -89,7 +89,7 @@ module Client = struct
                 | Ok flow ->
                     Fun.protect
                       (fun () ->
-                        let rw = Packet.connect (Option.get @@ Sockets.get_flow flow) in
+                        let rw = Packet.connect flow in
                         t.message_cb ~dst:t.address ~buf:buffer ();
 
                         (* An existing connection to the server might have been closed by the server;
@@ -100,7 +100,7 @@ module Client = struct
                         (* Rewrite the query id back to the original *)
                         Cstruct.BE.set_uint16 buf 0 client_id;
                         Ok buf)
-                      ~finally:(fun () -> Option.iter Flow.close (Sockets.get_flow flow)))
+                      ~finally:(fun () -> Flow.close flow))
         | _ ->
             Log.err (fun f ->
                 f "%s: rpc: failed to parse request" (to_string t));
@@ -235,7 +235,7 @@ module Client = struct
                     ( t.address.Dns_forward_config.Address.ip,
                       t.address.Dns_forward_config.Address.port )
                   >>= fun flow ->
-                  let rw = Packet.connect @@ Option.get @@ Sockets.get_flow flow in
+                  let rw = Packet.connect flow in
                   t.rw <- Some rw;
                   Fiber.fork ~sw (dispatcher t rw);
                   Ok rw
@@ -365,8 +365,7 @@ module Server = struct
 
     let listen ~sw { server; _ } cb =
       Sockets.listen ~sw server (fun flow ->
-          let underlying_flow = Option.get @@ Sockets.get_flow flow in
-          let rw = Packet.connect underlying_flow in
+          let rw = Packet.connect flow in
           let rec loop () =
             Packet.read rw >>= fun request ->
             Fiber.fork ~sw (fun () ->

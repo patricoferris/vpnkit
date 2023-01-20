@@ -1,5 +1,5 @@
 (library
  (name dns_forward)
- (libraries eio eio.core logs dns astring result cstruct fmt ipaddr sexplib duration)
+ (libraries eio eio.core iflow logs dns astring result cstruct fmt ipaddr sexplib duration)
  (preprocess
   (pps ppx_sexp_conv)))
