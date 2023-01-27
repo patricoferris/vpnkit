@@ -1,5 +1,5 @@
-open Lwt.Infix
 open Astring
+open Eio
 
 let src =
   let src = Logs.Src.create "http" ~doc:"HTTP proxy" in
@@ -8,7 +8,7 @@ let src =
 
 module Log = (val Logs.src_log src : Logs.LOG)
 
-let errorf fmt = Fmt.kstr (fun e -> Lwt.return (Error (`Msg e))) fmt
+let errorf fmt = Fmt.kstr (fun e -> Error (`Msg e)) fmt
 
 module Match = struct
 
@@ -97,7 +97,7 @@ end
 module Make
     (Ip: Tcpip.Ip.S with type ipaddr = Ipaddr.V4.t)
     (Udp: Tcpip.Udp.S with type ipaddr = Ipaddr.V4.t)
-    (Tcp:Mirage_flow_combinators.SHUTDOWNABLE)
+    (Tcp: Tcpip.Tcp.S with type ipaddr = Ipaddr.V4.t)
     (Remote: Sig.FLOW_CLIENT with type address = Ipaddr.t * int)
     (Dns_resolver: Sig.DNS)
 = struct
@@ -144,23 +144,21 @@ module Make
     allow_error_msg: string;
   }
 
-  let resolve_ip name_or_ip =
+  let resolve_ip ~net name_or_ip =
     match Ipaddr.of_string name_or_ip with
     | Error _ ->
       let open Dns.Packet in
       let question =
         make_question ~q_class:Q_IN Q_A (Dns.Name.of_string name_or_ip)
       in
-      Dns_resolver.resolve question
-      >>= fun rrs ->
+      let rrs = Dns_resolver.resolve net question in
       (* Any IN record will do (NB it might be a CNAME) *)
       let rec find_ip = function
-        | { cls = RR_IN; rdata = A ipv4; _ } :: _ ->
-          Lwt.return (Ok (Ipaddr.V4 ipv4))
+        | { cls = RR_IN; rdata = A ipv4; _ } :: _ -> Ok (Ipaddr.V4 ipv4)
         | _ :: rest -> find_ip rest
         | [] -> errorf "Failed to lookup host: %s" name_or_ip in
       find_ip rrs
-    | Ok x -> Lwt.return (Ok x)
+    | Ok x ->Ok x
 
   let to_json t =
     let open Ezjsonm in
@@ -215,9 +213,9 @@ module Make
         with Not_found -> default_error_msg in
       let http = match http with None -> None | Some x -> proxy_of_string x in
       let https = match https with None -> None | Some x -> proxy_of_string x in
-      Lwt.return (Ok { http; https; exclude; transparent_http_ports; transparent_https_ports; allow_enabled; allow; allow_error_msg })
+      Ok { http; https; exclude; transparent_http_ports; transparent_https_ports; allow_enabled; allow; allow_error_msg }
     with e ->
-      Lwt.return (Error (`Msg (Printf.sprintf "parsing json: %s" (Printexc.to_string e))))
+      Error (`Msg (Printf.sprintf "parsing json: %s" (Printexc.to_string e)))
 
   let to_string t = Ezjsonm.to_string ~minify:true @@ to_json t
 
@@ -228,19 +226,31 @@ module Make
     let allow = List.map Match.One.of_string allow in
     let t = { http; https; exclude; transparent_http_ports; transparent_https_ports; allow_enabled; allow; allow_error_msg } in
     Log.info (fun f -> f "HTTP proxy settings changed to: %s" (to_string t));
-    Lwt.return (Ok t)
+    Ok t
 
   module Incoming = struct
-    module C = Mirage_channel.Make(Tcp)
-    module IO = Cohttp_mirage_io.Make(C)
-    module Request = Cohttp.Request.Make(IO)
-    module Response = Cohttp.Response.Make(IO)
+    module Request = struct
+      include Cohttp_eio.Body
+      include Cohttp_eio.Server
+      include Http.Request
+    end
+    module Response = struct
+      include Cohttp_eio.Body
+      include Cohttp_eio.Server
+      include Http.Response
+    end
   end
   module Outgoing = struct
-    module C = Mirage_channel.Make(Remote)
-    module IO = Cohttp_mirage_io.Make(C)
-    module Request = Cohttp.Request.Make(IO)
-    module Response = Cohttp.Response.Make(IO)
+    module Request = struct
+      include Cohttp_eio.Body
+      include Cohttp_eio.Server
+      include Http.Request
+    end
+    module Response = struct
+      include Cohttp_eio.Body
+      include Cohttp_eio.Server
+      include Http.Response
+    end
   end
 
   (* Since we've already layered a channel on top, we can't use the Mirage_flow.proxy
@@ -248,201 +258,174 @@ module Make
      channel-level proxy here: *)
   let proxy_bytes ~incoming ~outgoing ~flow ~remote =
     (* forward outgoing to ingoing *)
-    let a_t flow ~incoming ~outgoing =
-      let warn pp e =
-        Log.warn (fun f -> f "Unexpected exeption %a in proxy" pp e);
-      in
+    (* TODO: Is this the right semantics? *)
+    let a_t flow ~incoming ~outgoing () =
       let rec loop () =
-        Lwt.catch
-          (fun () ->
-            Outgoing.C.read_some outgoing >>= function
-              | Ok `Eof        -> Lwt.return false
-              | Error e        -> warn Outgoing.C.pp_error e; Lwt.return false
-              | Ok (`Data buf) ->
-                Incoming.C.write_buffer incoming buf;
-                Incoming.C.flush incoming >|= function
-                | Ok ()         -> true
-                | Error `Closed -> false
-                | Error e       -> warn Incoming.C.pp_write_error e; false
-          ) (fun e ->
-            Log.warn (fun f -> f "a_t: caught unexpected exception: %s" (Printexc.to_string e));
-            Lwt.return false
-          )
-        >>= fun continue ->
-        if continue then loop () else Tcp.close flow
+        let continue =
+          try
+              Flow.copy outgoing incoming;
+              true
+          with e ->
+              Log.warn (fun f -> f "a_t: caught unexpected exception: %s" (Printexc.to_string e));
+              false
+        in
+        if continue then loop () else Flow.close flow
       in
       loop () in
 
     (* forward ingoing to outgoing *)
-    let b_t remote ~incoming ~outgoing =
+    let b_t remote ~incoming ~outgoing () =
       let warn pp e =
         Log.warn (fun f -> f "Unexpected exeption %a in proxy" pp e);
       in
       let rec loop () =
-        Lwt.catch
-          (fun () ->
-            Incoming.C.read_some incoming >>= function
-              | Ok `Eof        -> Lwt.return false
-              | Error e        -> warn Incoming.C.pp_error e; Lwt.return false
-              | Ok (`Data buf) ->
-                Outgoing.C.write_buffer outgoing buf;
-                Outgoing.C.flush outgoing >|= function
-                | Ok ()         -> true
-                | Error `Closed -> false
-                | Error e       -> warn Outgoing.C.pp_write_error e; false
-          ) (fun e ->
+        let continue =
+          try
+            Flow.copy incoming outgoing;
+            true
+          with e ->
             Log.warn (fun f -> f "b_t: caught unexpected exception: %s" (Printexc.to_string e));
-            Lwt.return false
-          )
-        >>= fun continue ->
-        if continue then loop () else Remote.shutdown_write remote
+            false
+          in
+        if continue then loop () else Flow.shutdown remote `Send
       in
       loop () in
-    Lwt.join [
+    Eio.Fiber.all [
       a_t flow ~incoming ~outgoing;
       b_t remote ~incoming ~outgoing
     ]
 
-  let rec proxy_body_request_exn ~reader ~writer =
-    let open Cohttp.Transfer in
-    Incoming.Request.read_body_chunk reader >>= function
-    | Done          -> Lwt.return_unit
-    | Final_chunk x -> Outgoing.Request.write_body writer x
-    | Chunk x       ->
-      Outgoing.Request.write_body writer x >>= fun () ->
-      proxy_body_request_exn ~reader ~writer
+  let rec proxy_body_request_exn ~reader:(req, reader) =
+    let open Incoming.Request in
+    let body_writer handle_chunk =
+      let _ : Http.Header.t option = Incoming.Request.read_chunked req reader handle_chunk in
+      ()
+    in
+    Cohttp_eio.Body.{ body_writer; trailer_writer = (fun _ -> ())}
 
-  let rec proxy_body_response_exn ~reader ~writer =
-    let open Cohttp.Transfer in
-    Outgoing.Response.read_body_chunk reader  >>= function
-    | Done          -> Lwt.return_unit
-    | Final_chunk x -> Incoming.Response.write_body writer x
-    | Chunk x       ->
-      Incoming.Response.write_body writer x >>= fun () ->
-      proxy_body_response_exn ~reader ~writer
+  let rec proxy_body_response_exn ~reader:(req, reader) =
+    let open Incoming.Request in
+    let body_writer handle_chunk = let _ = Outgoing.Response.read_chunked req reader handle_chunk in () in
+      Cohttp_eio.Body.{ body_writer; trailer_writer = (fun _ -> ())}
 
   (* Take a request and a pair (incoming, outgoing) of channels, send
      the request to the outgoing channel and then proxy back any response.
      This function can raise exceptions because Cohttp can raise exceptions. *)
-  let proxy_request ~description ~incoming ~outgoing ~flow ~remote ~req =
+  let proxy_request ~description ~incoming ~outgoing ~flow ~remote ~req:(req, req_body) =
     (* Cohttp can fail promises so we catch them here *)
-    Lwt.catch
-      (fun () ->
-        let reader = Incoming.Request.make_body_reader req incoming in
+    try
+        (* let reader = Eio.Buf_read.of_buffer (Cstruct.create 1024).buffer in *)
+        (* let reader = Incoming.Request.make_body_reader req incoming in *)
         Log.info (fun f -> f "Outgoing.Request.write");
-        Outgoing.Request.write ~flush:true (fun writer ->
+        let outgoing_read_buf = Eio.Buf_read.of_flow ~max_size:max_int outgoing in
+        Eio.Buf_write.with_flow flow @@ fun w ->
+        Cohttp_eio.Client.write_request false req w (
             match Incoming.Request.has_body req with
-            | `Yes     -> proxy_body_request_exn ~reader ~writer
-            | `No      -> Lwt.return_unit
+            | `Yes     -> Cohttp_eio.Body.Chunked (proxy_body_request_exn ~reader:(req, req_body))
+            | `No      -> Cohttp_eio.Body.Empty
             | `Unknown ->
               Log.warn (fun f ->
                   f "Request.has_body returned `Unknown: not sure what \
                       to do");
-              Lwt.return_unit
-          ) req outgoing
-        >>= fun () ->
+              Cohttp_eio.Body.Empty
+          );
         Log.info (fun f -> f "Outgoing.Response.read");
 
-        Outgoing.Response.read outgoing >>= function
-        | `Eof ->
+        let res = Cohttp_eio.Client.response outgoing_read_buf in
+        match res, outgoing_read_buf with
+        | exception End_of_file ->
           Log.warn (fun f -> f "%s: EOF" (description false));
-          Lwt.return false
-        | `Invalid x ->
+          false
+        | exception e ->
           Log.warn (fun f ->
               f "%s: Failed to parse HTTP response: %s"
-                (description false) x);
-          Lwt.return false
-        | `Ok res ->
+                (description false) (Printexc.to_string e));
+          false
+        | res, body ->
           Log.info (fun f ->
               f "%s: %s %s"
                 (description false)
-                (Cohttp.Code.string_of_version res.Cohttp.Response.version)
-                (Cohttp.Code.string_of_status res.Cohttp.Response.status));
+                (Http.Version.to_string (Http.Response.version res))
+                (Http.Status.to_string (Http.Response.status res)));
           Log.debug (fun f ->
-              f "%s" (Sexplib.Sexp.to_string_hum
-                        (Cohttp.Response.sexp_of_t res)));
-          let res_headers = res.Cohttp.Response.headers in
+              f "%a" Http.Response.pp res);
+          let res_headers = Http.Response.headers res in
           let connection_close =
             (* HTTP 1.0 defaults to Connection: close *)
-            match res.Cohttp.Response.version, Cohttp.Header.get res_headers "connection" with
+            match Http.Response.version res, Http.Header.get res_headers "connection" with
             | _, Some "keep-alive" -> false
             | _, Some "close" -> true
             | `HTTP_1_0, _ -> true
             | _, _ -> false in
-          match Cohttp.Request.meth req, Cohttp.Response.status res with
+          match Http.Request.meth req, Http.Response.status res with
           | `CONNECT, `OK ->
             (* Write the response and then switch to proxying the bytes *)
-            Incoming.Response.write ~flush:true (fun _writer -> Lwt.return_unit) res incoming
-            >>= fun () ->
-            proxy_bytes ~incoming ~outgoing ~flow ~remote
-            >>= fun () ->
+            (Eio.Buf_write.with_flow incoming @@ fun w -> Cohttp_eio.Server.write_response w (res, Cohttp_eio.Body.Empty));
+            (* Incoming.Response.write ~flush:true (fun _writer -> Lwt.return_unit) res incoming; *)
+            proxy_bytes ~incoming ~outgoing ~flow ~remote;
             Log.debug (fun f -> f "%s: HTTP CONNECT complete" (description false));
-            Lwt.return false
+            false
           | _, _ ->
             (* Otherwise stay in HTTP mode *)
-            let reader = Outgoing.Response.make_body_reader res outgoing in
-            Incoming.Response.write ~flush:true (fun writer ->
-                match Cohttp.Request.meth req, Incoming.Response.has_body res with
-                | `HEAD, `Yes ->
+            Eio.Buf_write.with_flow incoming @@ fun w ->
+            Cohttp_eio.Server.write_response w (res,
+                match Http.Request.meth req, Buf_read.at_end_of_input body with
+                | `HEAD, true ->
                   (* Bug in cohttp.1.0.2: according to Section 9.4 of RFC2616
                     https://www.w3.org/Protocols/rfc2616/rfc2616-sec9.html
                     > The HEAD method is identical to GET except that the server
                     > MUST NOT return a message-body in the response.
                   *)
                   Log.debug (fun f -> f "%s: HEAD requests MUST NOT have response bodies" (description false));
-                  Lwt.return_unit
-                | _, `Yes     ->
+                  Cohttp_eio.Body.Empty
+                | _, true     ->
                   Log.info (fun f -> f "%s: proxying body" (description false));
-                  proxy_body_response_exn ~reader ~writer
-                  >>= fun () ->
-                  Lwt.return_unit
-                | _, `No      ->
+                  Cohttp_eio.Body.Chunked (proxy_body_response_exn ~reader:(req, body))
+                | _, false      ->
                   Log.info (fun f -> f "%s: no body to proxy" (description false));
-                  Lwt.return_unit
-                | _, `Unknown when connection_close ->
+                  Cohttp_eio.Body.Empty
+                (* | _, `Unknown when connection_close ->
                   (* There may be a body between here and the EOF *)
                   Log.info (fun f -> f "%s: proxying until EOF" (description false));
-                  proxy_body_response_exn ~reader ~writer
+                  Cohttp_eio.Body.Chunked (proxy_body_response_exn ~reader)
                 | _, `Unknown ->
                   Log.warn (fun f ->
                       f "Response.has_body returned `Unknown: not sure \
                           what to do");
-                  Lwt.return_unit
-              ) res incoming
-            >>= fun () ->
-            Lwt.return (not connection_close)
-      ) (fun e ->
+                  Cohttp_eio.Body.Empty *)
+              );
+            not connection_close
+        with e ->
         Log.warn (fun f -> f "proxy_request caught exception: %s" (Printexc.to_string e));
-        Lwt.return false
-      )
+        false
 
   let add_proxy_authorization proxy headers =
     let proxy_authorization = "Proxy-Authorization" in
-    let headers = Cohttp.Header.remove headers proxy_authorization in
+    let headers = Http.Header.remove headers proxy_authorization in
     match Uri.userinfo proxy with
       | None -> headers
-      | Some s -> Cohttp.Header.add headers proxy_authorization ("Basic " ^ (Base64.encode_exn s))
+      | Some s -> Http.Header.add headers proxy_authorization ("Basic " ^ (Base64.encode_exn s))
 
-  let address_of_proxy ~localhost_names ~localhost_ips proxy =
+  let address_of_proxy ~net ~localhost_names ~localhost_ips proxy =
     match Uri.host proxy, Uri.port proxy with
     | None, _ ->
-      Lwt.return (Error (`Msg ("HTTP proxy URI does not include a hostname: " ^ (Uri.to_string proxy))))
+      Error (`Msg ("HTTP proxy URI does not include a hostname: " ^ (Uri.to_string proxy)))
     | _, None ->
-      Lwt.return (Error (`Msg ("HTTP proxy URI does not include a port: " ^ (Uri.to_string proxy))))
+      Error (`Msg ("HTTP proxy URI does not include a port: " ^ (Uri.to_string proxy)))
     | Some host, Some port ->
       let host =
         if List.mem (Dns.Name.of_string host) localhost_names
         then "localhost"
         else host in
-      resolve_ip host
-      >>= function
-      | Error e -> Lwt.return (Error e)
+      resolve_ip ~net host
+      |> function
+      | Error e -> Error e
       | Ok ip ->
         let ip =
           if List.mem ip localhost_ips
           then Ipaddr.(V4 V4.localhost)
           else ip in
-        Lwt.return (Ok (ip, port))
+        Ok (ip, port)
 
   let send_error status incoming description =
     let header = "HTTP/1.1 " ^ status ^ " " ^ description ^ "\r\nConnection: closed\r\n\r\n" in
@@ -468,28 +451,20 @@ module Make
 </html>
     |} in
     let response = header ^ body in
-    Incoming.C.write_string incoming response 0 (String.length response);
-    begin Incoming.C.flush incoming >>= function
-    | Error _ ->
-      Log.warn (fun f -> f "failed to return %s %s" status description);
-      Lwt.return_unit
-    | Ok () ->
-      Lwt.return_unit
-    end
+    Eio.Buf_write.with_flow incoming @@ fun w ->
+    Eio.Buf_write.string w response ~off:0 ~len:(String.length response);
+    Eio.Buf_write.flush w
 
-  let tunnel_https_over_connect ~localhost_names ~localhost_ips ~dst proxy =
+  let tunnel_https_over_connect ~sw ~net ~localhost_names ~localhost_ips ~dst proxy =
     let listeners _port =
       Log.debug (fun f -> f "HTTPS TCP handshake complete");
       let process flow =
-        Lwt.catch
-          (fun () ->
-            Lwt.finalize
+        try
+            Fun.protect
               (fun () ->
-                address_of_proxy ~localhost_names ~localhost_ips proxy
-                >>= function
+                match address_of_proxy ~net ~localhost_names ~localhost_ips proxy with
                 | Error (`Msg m) ->
-                  Log.warn (fun f -> f "HTTP proxy: cannot forward to %s: %s" (Uri.to_string proxy) m);
-                  Lwt.return_unit
+                  Log.warn (fun f -> f "HTTP proxy: cannot forward to %s: %s" (Uri.to_string proxy) m)
                 | Ok ((ip, port) as address) ->
                   let host = Ipaddr.V4.to_string dst in
                   let description outgoing =
@@ -501,52 +476,43 @@ module Make
                     let host = Ipaddr.V4.to_string dst in
                     let port = 443 in
                     let uri = Uri.make ~host ~port () in
-                    let headers = add_proxy_authorization proxy (Cohttp.Header.init ()) in
-                    let request = Cohttp.Request.make ~meth:`CONNECT ~headers uri in
-                    { request with Cohttp.Request.resource = host ^ ":" ^ (string_of_int port) }
+                    let headers = add_proxy_authorization proxy (Http.Header.init ()) in
+                    let request = Http.Request.make ~meth:`CONNECT ~headers (Uri.to_string uri) in
+                    { request with Http.Request.resource = host ^ ":" ^ (string_of_int port) }
                   in
-                  Remote.connect address >>= function
+                  match Remote.connect ~sw ~net address with
                   | Error _ ->
                     Log.warn (fun f ->
-                        f "Failed to connect to %s" (string_of_address address));
-                    Lwt.return_unit
+                        f "Failed to connect to %s" (string_of_address address))
                   | Ok remote ->
-                    let outgoing = Outgoing.C.create remote in
-                    Lwt.finalize  (fun () ->
-                        Outgoing.Request.write ~flush:true (fun _ -> Lwt.return_unit)
-                          connect outgoing
-                        >>= fun () ->
-                        Outgoing.Response.read outgoing >>= function
-                        | `Eof ->
+                    let outgoing_buf_read = Eio.Buf_read.of_flow ~max_size:max_int remote in
+                    Fun.protect  (fun () ->
+                        (Eio.Buf_write.with_flow remote @@ fun w -> Cohttp_eio.Client.write_request false connect w Cohttp_eio.Body.Empty);
+                        match Cohttp_eio.Client.response outgoing_buf_read with
+                        | exception End_of_file ->
                           Log.warn (fun f ->
-                              f "EOF from %s" (string_of_address address));
-                          Lwt.return_unit
-                        | `Invalid x ->
+                              f "EOF from %s" (string_of_address address))
+                        | exception x ->
                           Log.warn (fun f ->
                               f "Failed to parse HTTP response on port %s: %s"
-                                (string_of_address address) x);
-                          Lwt.return_unit
-                        | `Ok res ->
+                                (string_of_address address) (Printexc.to_string x))
+                        | res ->
                           Log.info (fun f ->
-                              let open Cohttp.Response in
+                              let open Http.Response in
                               f "%s: %s %s"
                                 (description false)
-                                (Cohttp.Code.string_of_version res.version)
-                                (Cohttp.Code.string_of_status res.status));
+                                (Http.Version.to_string res.version)
+                                (Http.Status.to_string res.status));
                           Log.debug (fun f ->
-                              f "%s" (Sexplib.Sexp.to_string_hum
-                                        (Cohttp.Response.sexp_of_t res)));
-                          let incoming = Incoming.C.create flow in
-                          proxy_bytes ~incoming ~outgoing ~flow ~remote
-                      ) (fun () -> Remote.close remote)
-              ) (fun () -> Tcp.close flow)
-          ) (fun e ->
-            Log.warn (fun f -> f "tunnel_https_over_connect caught exception: %s" (Printexc.to_string e));
-            Lwt.return_unit
-          )
+                              f "%a" Http.Response.pp res);
+                          proxy_bytes ~incoming:flow ~outgoing:remote ~flow ~remote
+                      ) ~finally:(fun () -> Flow.close remote)
+              ) ~finally:(fun () -> Flow.close flow)
+        with e ->
+          Log.warn (fun f -> f "tunnel_https_over_connect caught exception: %s" (Printexc.to_string e))
       in Some process
     in
-    Lwt.return listeners
+    listeners
 
   (* A route is a decision about where to send an HTTP request. It depends on
      - whether a proxy is configured or not
@@ -561,14 +527,12 @@ module Make
   }
 
   let get_host req =
-    let uri = Cohttp.Request.uri req in
     (* A host in the URI takes precedence over a host: header *)
-    match Uri.host uri, Cohttp.Header.get req.Cohttp.Request.headers "host" with
+    let uri = Cohttp.Request.uri req in
+    match Uri.host uri, Http.Header.get req.Http.Request.headers "host" with
     | None, None ->
-      Log.warn (fun f -> f "HTTP request had no host in the URI nor in the host: header: %s"
-        (Sexplib.Sexp.to_string_hum
-          (Cohttp.Request.sexp_of_t req))
-      );
+      Log.warn (fun f -> f "HTTP request had no host in the URI nor in the host: header: %a"
+        Http.Request.pp req);
       Error `Missing_host_header
     | Some host, _
     | None, Some host ->
@@ -576,13 +540,13 @@ module Make
       let port = match Uri.port uri with None -> 80 | Some p -> p in
       Ok (host, port)
 
-  let route ?(localhost_names=[]) ?(localhost_ips=[]) proxy exclude allow_enabled allow req =
+  let route ?(localhost_names=[]) ?(localhost_ips=[]) ~net proxy exclude allow_enabled allow req =
     match get_host req with
-    | Error x -> Lwt.return (Error x)
+    | Error x -> Error x
     | Ok (host, port) ->
       Log.debug (fun f -> f "host from request = %s:%d" host port);
       if allow_enabled && not(Match.matches host allow)
-      then Lwt.return (Error (`Refused host))
+      then Error (`Refused host)
       else
       (* A proxy URL must have both a host and a port to be useful *)
       let hostport_from_proxy = match proxy with
@@ -609,18 +573,17 @@ module Make
           else Some (proxy, `Proxy) in
       begin match hostport_and_ty with
       | None ->
-        Log.warn (fun f -> f "Failed to route request: %s" (Sexplib.Sexp.to_string_hum (Cohttp.Request.sexp_of_t req)));
-        Lwt.return (Error `Missing_host_header)
+        Log.warn (fun f -> f "Failed to route request: %a" Http.Request.pp req);
+        Error `Missing_host_header
       | Some ((next_hop_host, next_hop_port), ty) ->
         let next_hop_host =
           if List.mem (Dns.Name.of_string next_hop_host) localhost_names
           then "localhost"
           else next_hop_host in
         Log.debug (fun f -> f "next_hop_address is %s:%d" next_hop_host next_hop_port);
-        resolve_ip next_hop_host
-        >>= function
-        | Error (`Msg m) ->
-          Lwt.return (Error (`Msg m))
+        resolve_ip ~net next_hop_host
+        |> function
+        | Error (`Msg m) -> Error (`Msg m)
         | Ok next_hop_ip ->
           let next_hop_ip =
             if List.mem next_hop_ip localhost_ips
@@ -630,67 +593,58 @@ module Make
             Printf.sprintf "HTTP proxy %s %s:%d Host:%s:%d (%s)"
               (if outgoing then "-->" else "<--") (Ipaddr.to_string next_hop_ip) next_hop_port host port
               (match ty with `Origin -> "Origin" | `Proxy -> "Proxy") in
-          Lwt.return (Ok { next_hop_address = (next_hop_ip, next_hop_port); host; port; description; ty })
+          Ok { next_hop_address = (next_hop_ip, next_hop_port); host; port; description; ty }
       end
 
-  let fetch ?localhost_names ?localhost_ips ~flow proxy exclude allow_enabled allow allow_error_msg incoming req =
-    let uri = Cohttp.Request.uri req in
-    let meth = Cohttp.Request.meth req in
-    route ?localhost_names ?localhost_ips proxy exclude allow_enabled allow req
-    >>= function
+  let fetch ?localhost_names ?localhost_ips ~net ~flow proxy exclude allow_enabled allow allow_error_msg incoming (req, body) =
+    Eio.Switch.run @@ fun sw ->
+    let meth = Http.Request.meth req in
+    let uri = Cohttp.Request.uri req  in
+    match route ?localhost_names ?localhost_ips ~net proxy exclude allow_enabled allow req with
     | Error `Missing_host_header ->
-      send_error "400" incoming "request must contain an absolute URI"
-      >>= fun () ->
-      Lwt.return false
+      send_error "400" incoming "request must contain an absolute URI";
+      false
     | Error (`Refused host) ->
-      send_error "403" incoming (Stringext.replace_all allow_error_msg ~pattern:"%s" ~with_:host)
-      >>= fun () ->
-      Lwt.return false
+      send_error "403" incoming (Stringext.replace_all allow_error_msg ~pattern:"%s" ~with_:host);
+      false
     | Error (`Msg m) ->
-      send_error "503" incoming m
-      >>= fun () ->
-      Lwt.return false
+      send_error "503" incoming m;
+      false
     | Ok { next_hop_address; host; port; description; ty } ->
       Log.info (fun f ->
           f "%s: %s %s"
             (description true)
-            (Cohttp.(Code.string_of_method meth))
+            (Http.(Method.to_string meth))
             (Uri.path uri));
       Log.debug (fun f ->
-          f "%s: received %s"
+          f "%s: received %a"
             (description false)
-            (Sexplib.Sexp.to_string_hum
-              (Cohttp.Request.sexp_of_t req))
+            Http.Request.pp req
           );
-      begin Remote.connect next_hop_address >>= function
+      begin
+        match Remote.connect ~sw ~net next_hop_address with
       | Error _ ->
         let message = match ty with
           | `Origin -> Printf.sprintf "unable to connect to %s. Do you need an HTTP proxy?" (string_of_address next_hop_address)
           | `Proxy -> Printf.sprintf "unable to connect to HTTP proxy %s" (string_of_address next_hop_address) in
         Log.warn (fun f -> f "%s: %s" (description true) message);
-        send_error "503" incoming message
-        >>= fun () ->
-        Lwt.return false
+        send_error "503" incoming message;
+        false
       | Ok remote ->
-        Lwt.finalize  (fun () ->
+        Fun.protect (fun () ->
           Log.info (fun f ->
               f "%s: Successfully connected to %s" (description true) (string_of_address next_hop_address));
-          let outgoing = Outgoing.C.create remote in
-          match ty, Cohttp.Request.meth req with
+          (* let outgoing = Outgoing.C.create remote in *)
+          match ty, Http.Request.meth req with
           | `Origin, `CONNECT ->
             (* return 200 OK and start a TCP proxy *)
             let response = "HTTP/1.1 200 OK\r\n\r\n" in
-            Incoming.C.write_string incoming response 0 (String.length response);
-            begin Incoming.C.flush incoming >>= function
-            | Error _ ->
-              Log.warn (fun f -> f "%s: failed to return 200 OK" (description false));
-              Lwt.return false
-            | Ok () ->
-              proxy_bytes ~incoming ~outgoing ~flow ~remote
-              >>= fun () ->
-              Log.debug (fun f -> f "%s: HTTP CONNECT complete" (description false));
-              Lwt.return false
-            end
+            Eio.Buf_write.with_flow incoming (fun w ->
+              Eio.Buf_write.string w response ~off:0 ~len:(String.length response);
+            );
+            proxy_bytes ~incoming ~outgoing:remote ~flow ~remote;
+            Log.debug (fun f -> f "%s: HTTP CONNECT complete" (description false));
+            false
           | _, _ ->
             (* If the request is to an origin server we should convert back to a relative URI
                and a Host: header.
@@ -698,81 +652,74 @@ module Make
                the Host: header.
                In all cases we should make sure the host header is correct. *)
             let host_and_port = host ^ (match port with 80 -> "" | _ -> ":" ^ (string_of_int port)) in
-            let headers = Cohttp.Header.replace req.Cohttp.Request.headers "host" host_and_port in
+            let headers = Http.Header.replace req.Http.Request.headers "host" host_and_port in
             (* If the request is to a proxy then we should add a Proxy-Authorization header *)
             let headers = match proxy with
               | None -> headers
               | Some proxy -> add_proxy_authorization proxy headers in
-            let resource = match ty, Cohttp.Request.meth req with
+            let resource = match ty, Http.Request.meth req with
               | `Origin, _ -> Uri.path_and_query uri
               | `Proxy, `CONNECT -> host_and_port
               | `Proxy, _ -> Uri.with_scheme (Uri.with_host (Uri.with_port uri (Some port)) (Some host)) (Some "http") |> Uri.to_string in
-            let req = { req with Cohttp.Request.headers; resource } in
-            Log.debug (fun f -> f "%s: sending %s"
+            let req = { req with Http.Request.headers; resource } in
+            Log.debug (fun f -> f "%s: sending %a"
               (description false)
-              (Sexplib.Sexp.to_string_hum
-                (Cohttp.Request.sexp_of_t req))
+              Http.Request.pp req
             );
-            proxy_request ~description ~incoming ~outgoing ~flow ~remote ~req
-        ) (fun () -> Remote.close remote)
+            proxy_request ~description ~incoming ~outgoing:remote ~flow ~remote ~req:(req, body)
+        )
+        ~finally:(fun () -> Flow.close remote)
       end
 
   (* A regular, non-transparent HTTP proxy implementation.
      If [proxy] is [None] then requests will be sent to origin servers;
      otherwise they will be sent to the upstream proxy. *)
-  let explicit_proxy ~localhost_names ~localhost_ips proxy exclude allow_enabled allow allow_error_msg () =
+  let explicit_proxy ~net ~localhost_names ~localhost_ips proxy exclude allow_enabled allow allow_error_msg () =
     let listeners _port =
       Log.debug (fun f -> f "HTTP TCP handshake complete");
       let process flow =
-        Lwt.catch
-          (fun () ->
-            Lwt.finalize (fun () ->
-                let incoming = Incoming.C.create flow in
+        try
+            Fun.protect (fun () ->
+                let incoming = Eio.Buf_read.of_flow ~max_size:max_int flow in
                 let rec loop () =
-                  Incoming.Request.read incoming >>= function
-                  | `Eof -> Lwt.return_unit
-                  | `Invalid x ->
+                  match Cohttp_eio.Server.read_request incoming with
+                  | exception End_of_file -> ()
+                  | exception x ->
                     Log.warn (fun f ->
                         f "HTTP proxy failed to parse HTTP request: %s"
-                          x);
-                    Lwt.return_unit
-                  | `Ok req ->
-                    fetch ~localhost_names ~localhost_ips ~flow proxy exclude allow_enabled allow allow_error_msg incoming req
-                    >>= function
+                          (Printexc.to_string x));
+                  | req ->
+                    match fetch ~net ~localhost_names ~localhost_ips ~flow proxy exclude allow_enabled allow allow_error_msg flow (req, incoming) with
                     | true ->
                       (* keep the connection open, read more requests *)
                       loop ()
                     | false ->
-                      Log.debug (fun f -> f "HTTP session complete, closing connection");
-                      Lwt.return_unit in
+                      Log.debug (fun f -> f "HTTP session complete, closing connection")
+                  in
                   loop ()
-              ) (fun () -> Tcp.close flow)
-          ) (fun e ->
-            Log.warn (fun f -> f "explicit_proxy caught exception: %s" (Printexc.to_string e));
-            Lwt.return_unit
-          )
+              ) ~finally:(fun () -> Flow.close flow)
+      with e ->
+        Log.warn (fun f -> f "explicit_proxy caught exception: %s" (Printexc.to_string e))
       in
       Some process
     in
-    Lwt.return listeners
+    listeners
 
-  let transparent_http ~dst ~localhost_names ~localhost_ips proxy exclude allow_enabled allow allow_error_msg =
+  let transparent_http ~net ~dst ~localhost_names ~localhost_ips proxy exclude allow_enabled allow allow_error_msg =
     let listeners _port =
       Log.debug (fun f -> f "HTTP TCP handshake complete");
       let process flow =
-        Lwt.catch
-          (fun () ->
-            Lwt.finalize (fun () ->
-              let incoming = Incoming.C.create flow in
+        try
+            Fun.protect (fun () ->
+              let incoming = Eio.Buf_read.of_flow ~max_size:max_int flow in
               let rec loop () =
-                Incoming.Request.read incoming >>= function
-                | `Eof -> Lwt.return_unit
-                | `Invalid x ->
+                match Cohttp_eio.Server.read_request incoming with
+                | exception End_of_file -> ()
+                | exception x ->
                   Log.warn (fun f ->
                       f "Failed to parse HTTP request on port %a:80: %s"
-                        Ipaddr.V4.pp dst x);
-                  Lwt.return_unit
-                | `Ok req ->
+                        Ipaddr.V4.pp dst (Printexc.to_string x))
+                | req ->
                   (* If there is no Host: header or host in the URI then add a
                     Host: header with the destination IP address -- this is not perfect
                     but better than nothing and the majority of people will supply a Host:
@@ -782,37 +729,35 @@ module Make
                     | Error `Missing_host_header ->
                       { req with Cohttp.Request.headers = Cohttp.Header.replace req.headers "host" (Ipaddr.V4.to_string dst) }
                     | Ok _ -> req in
-                  fetch ~localhost_names ~localhost_ips ~flow (Some proxy) exclude allow_enabled allow allow_error_msg incoming req
-                  >>= function
+                  match fetch ~net ~localhost_names ~localhost_ips ~flow (Some proxy) exclude allow_enabled allow allow_error_msg flow (req, incoming) with
                   | true ->
                     (* keep the connection open, read more requests *)
                     loop ()
                   | false ->
-                    Log.debug (fun f -> f "HTTP session complete, closing connection");
-                    Lwt.return_unit in
+                    Log.debug (fun f -> f "HTTP session complete, closing connection")
+                  in
                 loop ()
-              ) (fun () -> Tcp.close flow)
-          ) (fun e ->
-            Log.warn (fun f -> f "transparent_http caught exception: %s" (Printexc.to_string e));
-            Lwt.return_unit
-          )
+              )
+              ~finally:(fun () -> Flow.close flow)
+    with e ->
+      Log.warn (fun f -> f "transparent_http caught exception: %s" (Printexc.to_string e))
       in Some process
     in
-    Lwt.return listeners
+    listeners
 
-  let transparent_proxy_handler ~localhost_names ~localhost_ips ~dst:(ip, port) ~t =
+  let transparent_proxy_handler ~sw ~net ~localhost_names ~localhost_ips ~dst:(ip, port) ~t =
     match t.http, t.https with
-    | Some proxy, _ when List.mem port t.transparent_http_ports -> Some (transparent_http ~dst:ip ~localhost_names ~localhost_ips proxy t.exclude t.allow_enabled t.allow t.allow_error_msg)
+    | Some proxy, _ when List.mem port t.transparent_http_ports -> Some (transparent_http ~net ~dst:ip ~localhost_names ~localhost_ips proxy t.exclude t.allow_enabled t.allow t.allow_error_msg)
     | _, Some proxy when List.mem port t.transparent_https_ports ->
       if Match.matches (Ipaddr.V4.to_string ip) t.exclude
       then None
-      else Some (tunnel_https_over_connect ~localhost_names ~localhost_ips ~dst:ip proxy)
+      else Some (tunnel_https_over_connect ~sw ~net ~localhost_names ~localhost_ips ~dst:ip proxy)
     | _, _ -> None
 
-  let explicit_proxy_handler ~localhost_names ~localhost_ips ~dst:(_, port) ~t =
+  let explicit_proxy_handler ~sw:_ ~net ~localhost_names ~localhost_ips ~dst:(_, port) ~t =
     match port, t.http, t.https with
     | 3128, proxy, _
-    | 3129, _, proxy -> Some (explicit_proxy ~localhost_names ~localhost_ips proxy t.exclude t.allow_enabled t.allow t.allow_error_msg ())
+    | 3129, _, proxy -> Some (explicit_proxy ~net ~localhost_names ~localhost_ips proxy t.exclude t.allow_enabled t.allow t.allow_error_msg ())
     (* For other ports, refuse the connection *)
     | _, _, _ -> None
 end

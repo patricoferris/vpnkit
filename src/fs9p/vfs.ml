@@ -35,7 +35,7 @@ module Error = struct
     open Lwt.Infix
 
     let ( >>*= ) x f =
-      x >>= function Ok x -> f x | Error _ as e -> Lwt.return e
+      match x with Ok x -> f x | Error _ as e -> e
   end
 
   let pp f = function
@@ -49,18 +49,18 @@ end
 
 open Error.Infix
 
-let ok x = Lwt.return (Ok x)
+let ok x = Ok x
 
-let error fmt = Error.otherk Lwt.return fmt
+let error fmt = Error.otherk Fun.id fmt
 
-type 'a or_err = ('a, Error.t) result Lwt.t
+type 'a or_err = ('a, Error.t) result
 
 module File = struct
-  let err_no_entry = Lwt.return Error.no_entry
+  let err_no_entry = Error.no_entry
 
-  let err_read_only = Lwt.return Error.read_only_file
+  let err_read_only = Error.read_only_file
 
-  let err_perm = Lwt.return Error.perm
+  let err_perm = Error.perm
 
   let err_bad_write_offset off = error "Bad write offset %d" off
 
@@ -70,12 +70,12 @@ module File = struct
 
   let err_normal_only = error "Can't chmod special file"
 
-  let ok x = Lwt.return (Ok x)
+  let ok x = Ok x
 
   let check_offset ~offset len =
-    if offset < 0L then Lwt.return (Error.negative_offset offset)
+    if offset < 0L then Error.negative_offset offset
     else if offset > Int64.of_int len then
-      Lwt.return (Error.offset_too_large ~offset (Int64.of_int len))
+      Error.offset_too_large ~offset (Int64.of_int len)
     else ok ()
 
   let empty = Cstruct.create 0
@@ -90,13 +90,13 @@ module File = struct
 
     let write t = t.write
 
-    type 'a session = { mutable v : 'a; c : unit Lwt_condition.t }
+    type 'a session = { mutable v : 'a; c : Eio.Condition.t }
 
-    let session v = { v; c = Lwt_condition.create () }
+    let session v = { v; c = Eio.Condition.create () }
 
     let publish session v =
       session.v <- v;
-      Lwt_condition.broadcast session.c ()
+      Eio.Condition.broadcast session.c
 
     let create pp session =
       (* [buffer] is the remainder of the line we're currently sending to the client.
@@ -106,27 +106,27 @@ module File = struct
          [!buffer] is a thread in case the client does two reads at the same time,
          although that doesn't make much sense for streams anyway. *)
       let last = ref (Fmt.to_to_string pp session.v) in
-      let buffer = ref (Lwt.return (Cstruct.of_string !last)) in
+      let buffer = ref (fun () -> Cstruct.of_string !last) in
       let refill () =
         let rec next () =
           let current = Fmt.to_to_string pp session.v in
-          if current = !last then Lwt_condition.wait session.c >>= next
+          if current = !last then Eio.Condition.await_no_mutex session.c |> next
           else (
             last := current;
-            Lwt.return (Cstruct.of_string current) )
+            Cstruct.of_string current)
         in
-        buffer := next ()
+        buffer := fun () -> next ()
       in
       let rec read count =
-        !buffer >>= fun avail ->
+        let avail = !buffer () in
         if Cstruct.length avail = 0 then (
           refill ();
           read count )
         else
           let count = min count (Cstruct.length avail) in
           let response = Cstruct.sub avail 0 count in
-          buffer := Lwt.return (Cstruct.shift avail count);
-          Lwt.return (Ok response)
+          buffer := (fun () -> Cstruct.shift avail count);
+          Ok response
       in
       let write _ = err_read_only in
       { read; write }
@@ -213,7 +213,7 @@ module File = struct
 
   let size t =
     stat t >>*= fun info ->
-    Lwt.return (Ok info.length)
+    Ok info.length
 
   let open_ t = t.open_ ()
 
@@ -241,7 +241,7 @@ module File = struct
   let of_stream stream =
     let stat () = ok { length = 0L; perm = `Normal } in
     let open_ () =
-      stream () >>= fun s ->
+      let s = stream () in
       Fd.of_stream s
     in
     read_only_aux ~debug:"of_stream" ~stat ~open_
@@ -290,20 +290,19 @@ module File = struct
       let length =
         match length with
         | None ->
-            fn () >|= fun data ->
+            let data = fn () in 
             String.length data
         | Some f -> f ()
       in
-      length >|= fun length ->
       Ok { length = length |> Int64.of_int; perm = `Normal }
     in
     let open_ () =
-      let data =
-        fn () >|= fun result ->
+      let data () =
+        let result = fn () in
         ref (Cstruct.of_string result)
       in
       let read count =
-        data >>= fun data ->
+        let data = data () in
         let count = min count (Cstruct.length !data) in
         let result = Cstruct.sub !data 0 count in
         data := Cstruct.shift !data count;
@@ -364,7 +363,7 @@ module File = struct
         read () >>*= fun old ->
         let old = match old with None -> empty | Some old -> old in
         let extra = len - Cstruct.length old in
-        if extra = 0 then Lwt.return (Ok ())
+        if extra = 0 then Ok ()
         else if extra < 0 then write (Cstruct.sub old 0 len)
         else
           let padding = Cstruct.create extra in
@@ -382,7 +381,7 @@ module File = struct
     let data = ref (Cstruct.of_string init) in
     let stat () =
       let length = Int64.of_int (Cstruct.length !data) in
-      Lwt.return (Ok { length; perm = `Normal })
+      Ok { length; perm = `Normal }
     in
     let read () = ok (Some !data) in
     let write v =
@@ -414,7 +413,7 @@ module Dir = struct
 
   let err_dir_only = error "Can only contain directories"
 
-  let err_no_entry = Lwt.return Error.no_entry
+  let err_no_entry = Error.no_entry
 
   type t = {
     debug : string;
@@ -545,8 +544,8 @@ module Logs = struct
               ok ()
           | Error (`Msg msg) -> error "%s" msg )
     in
-    let chmod _ = Lwt.return Error.perm in
-    let remove () = Lwt.return Error.perm in
+    let chmod _ = Error.perm in
+    let remove () = Error.perm in
     File.of_kv ~read ~write ~stat:(File.stat_of ~read) ~remove ~chmod
 
   let src s =

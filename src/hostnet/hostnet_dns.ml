@@ -1,5 +1,3 @@
-open Lwt.Infix
-
 let src =
   let src = Logs.Src.create "dns" ~doc:"Resolve DNS queries on the host" in
   Logs.Src.set_level src (Some Logs.Info);
@@ -79,35 +77,31 @@ module Policy(Files: Sig.FILES) = struct
 
   (* Watch for the /etc/resolv.file *)
   let resolv_conf = "/etc/resolv.conf"
-  let _ : unit Lwt.t =
-    Files.watch_file resolv_conf (fun () ->
-        Lwt.async (fun () ->
-            Files.read_file resolv_conf
-            >>= function
-            | Error (`Msg m) ->
-              Log.info (fun f -> f "reading %s: %s" resolv_conf m);
-              Lwt.return_unit
-            | Ok txt ->
+
+  (* XXX: Hmmmm, pass switch through functor ^^' *)
+  let start ~sw fs : unit =
+    let resolv_conf = Eio.Path.(fs / resolv_conf) in
+    let w = Files.watch_file resolv_conf (fun () ->
+      Eio.Fiber.fork ~sw (fun () ->
+            match Files.read_file resolv_conf with
+            | exception e ->
+              Log.info (fun f -> f "reading %s: %s" (snd resolv_conf) (Printexc.to_string e))
+            | txt ->
               begin match Dns_forward.Config.Unix.of_resolv_conf txt with
               | Error (`Msg m) ->
-                Log.err (fun f -> f "parsing %s: %s" resolv_conf m);
-                Lwt.return_unit
+                Log.err (fun f -> f "parsing %s: %s" (snd resolv_conf) m)
               | Ok servers ->
-                add ~priority:2 ~config:(`Upstream servers);
-                Lwt.return_unit
+                add ~priority:2 ~config:(`Upstream servers)
               end
         )
-      )
-    >>= function
+      ) in
+    match w with
     | Error (`Msg "ENOENT") ->
-      Log.info (fun f -> f "Not watching %s because it does not exist" resolv_conf);
-      Lwt.return_unit
+      Log.info (fun f -> f "Not watching %s because it does not exist" (snd resolv_conf))
     | Error (`Msg m) ->
-      Log.info (fun f -> f "Cannot watch %s: %s" resolv_conf m);
-      Lwt.return_unit
+      Log.info (fun f -> f "Cannot watch %s: %s" (snd resolv_conf) m)
     | Ok _watch ->
-      Log.info (fun f -> f "Will watch %s for changes" resolv_conf);
-      Lwt.return_unit
+      Log.info (fun f -> f "Will watch %s for changes" (snd resolv_conf))
 
 end
 
@@ -189,8 +183,6 @@ module Make
     (Tcp: Tcpip.Tcp.S with type ipaddr = Ipaddr.V4.t)
     (Socket: Sig.SOCKETS)
     (D: Sig.DNS)
-    (Time: Mirage_time.S)
-    (Clock: Mirage_clock.MCLOCK)
     (Recorder: Sig.RECORDER) =
 struct
 
@@ -201,20 +193,20 @@ struct
 
   module Dns_tcp_client =
     Dns_forward.Rpc.Client.Persistent.Make(Socket.Stream.Tcp)
-      (Dns_forward.Framing.Tcp(Socket.Stream.Tcp))(Time)
+      (Dns_forward.Framing.Tcp)
 
   module Dns_tcp_resolver =
-    Dns_forward.Resolver.Make(Dns_tcp_client)(Time)(Clock)
+    Dns_forward.Resolver.Make(Dns_tcp_client)
 
   module Dns_udp_client =
     Dns_forward.Rpc.Client.Nonpersistent.Make(Socket.Datagram.Udp)
-      (Dns_forward.Framing.Udp(Socket.Datagram.Udp))(Time)
+      (Dns_forward.Framing.Udp)
 
   module Dns_udp_resolver =
-    Dns_forward.Resolver.Make(Dns_udp_client)(Time)(Clock)
+    Dns_forward.Resolver.Make(Dns_udp_client)
 
   (* We need to be able to parse the incoming framed TCP messages *)
-  module Dns_tcp_framing = Dns_forward.Framing.Tcp(Tcp)
+  module Dns_tcp_framing = Dns_forward.Framing.Tcp
 
   type dns = {
     dns_tcp_resolver: Dns_tcp_resolver.t;
@@ -226,9 +218,13 @@ struct
     | Host (* use the host resolver *)
 
   type t = {
+    sw: Eio.Switch.t;
     local_ip: Ipaddr.t;
     builtin_names: (Dns.Name.t * Ipaddr.t) list;
     resolver: resolver;
+    net : Eio.Net.t;
+    mono : Eio.Time.Mono.t;
+    clock : Eio.Time.clock;
   }
 
   let recorder = ref None
@@ -243,12 +239,10 @@ struct
         Log.warn (fun f -> f "No secure random number generator available")
       | Some _ ->
         Log.info (fun f -> f "Secure random number generator is available") in
-    Dns_tcp_resolver.destroy dns_tcp_resolver
-    >>= fun () ->
+    Dns_tcp_resolver.destroy dns_tcp_resolver;
     Dns_udp_resolver.destroy dns_udp_resolver
   | { resolver = Host; _ } ->
-    Log.info (fun f -> f "We do not need secure random numbers in Host mode");
-    Lwt.return_unit
+    Log.info (fun f -> f "We do not need secure random numbers in Host mode")
 
   let record_udp ~source_ip ~source_port ~dest_ip ~dest_port bufs =
     match !recorder with
@@ -305,7 +299,14 @@ struct
     | None ->
       Random.int bound
 
-  let create ~local_address ~builtin_names =
+  type 'a env = <
+    net : Eio.Net.t;             (** To connect to the servers *)
+    mono : Eio.Time.Mono.t;
+    clock : Eio.Time.clock;      (** Needed for timeouts *)
+    ..
+  > as 'a
+
+  let create ~sw ~local_address ~builtin_names (env : _ env) =
     let local_ip = local_address.Dns_forward.Config.Address.ip in
     Log.info (fun f ->
       let suffix = match builtin_names with
@@ -324,21 +325,19 @@ struct
         match src, dst with
         | { ip = Ipaddr.V4 source_ip; port = source_port },
           { ip = Ipaddr.V4 dest_ip; port = dest_port } ->
-          record_udp ~source_ip ~source_port ~dest_ip ~dest_port [ buf ];
-          Lwt.return_unit
+          record_udp ~source_ip ~source_port ~dest_ip ~dest_port [ buf ]
         | _ ->
           (* We don't know how to marshal IPv6 yet *)
-          Lwt.return_unit
+          ()
       in
-      Dns_udp_resolver.create ~gen_transaction_id ~message_cb config
-      >>= fun dns_udp_resolver ->
-      Dns_tcp_resolver.create ~gen_transaction_id ~message_cb config
-      >>= fun dns_tcp_resolver ->
-      Lwt.return { local_ip; builtin_names;
-                   resolver = Upstream { dns_tcp_resolver; dns_udp_resolver } }
+      let dns_udp_resolver = Dns_udp_resolver.create ~sw ~gen_transaction_id ~message_cb config in
+      let dns_tcp_resolver = Dns_tcp_resolver.create ~sw ~gen_transaction_id ~message_cb config in
+      { sw; local_ip; builtin_names;
+        resolver = Upstream { dns_tcp_resolver; dns_udp_resolver };
+        net = env#net; mono = env#mono; clock = env#clock }
     | `Host ->
       Log.info (fun f -> f "Will use the host's DNS resolver");
-      Lwt.return { local_ip; builtin_names; resolver = Host }
+      { sw; local_ip; builtin_names; resolver = Host; net = env#net; mono = env#mono; clock = env#clock }
 
   let search f low high =
     if not(f low)
@@ -358,12 +357,12 @@ struct
             else loop low mid in
       loop low high
 
-  let answer t is_tcp buf =
+  let answer ~sw ~net ~mono ~clock t is_tcp buf =
     let open Dns.Packet in
     let len = Cstruct.length buf in
     match Dns.Protocol.Server.parse (Cstruct.sub buf 0 len) with
     | None ->
-      Lwt.return (Error (`Msg "failed to parse DNS packet"))
+      Error (`Msg "failed to parse DNS packet")
     | Some ({ questions = [ question ]; _ } as request) ->
       let reply ~tc answers =
         let id = request.id in
@@ -413,46 +412,41 @@ struct
            than the addresses in the /etc/hosts file. *)
         match try_builtins t.builtin_names question with
         | `Does_not_exist ->
-          Lwt.return (Ok (Some (marshal nxdomain)))
+          Ok (Some (marshal nxdomain))
         | `Answers answers ->
-          Lwt.return (Ok (marshal_reply answers))
+          Ok (marshal_reply answers)
         | `Dont_know ->
           match try_etc_hosts question with
           | Some answers ->
-            Lwt.return (Ok (marshal_reply answers))
+            Ok (marshal_reply answers)
           | None ->
             match is_tcp, t.resolver with
             | true, Upstream { dns_tcp_resolver; _ } ->
               begin
-                Dns_tcp_resolver.answer buf dns_tcp_resolver
-                >>= function
-                | Error e -> Lwt.return (Error e)
-                | Ok buf -> Lwt.return (Ok (Some buf))
+                match Dns_tcp_resolver.answer ~sw ~net ~mono ~clock buf dns_tcp_resolver with
+                | Error e -> Error e
+                | Ok buf -> Ok (Some buf)
               end
             | false, Upstream { dns_udp_resolver; _ } ->
               begin
-                Dns_udp_resolver.answer buf dns_udp_resolver
-                >>= function
-                | Error e -> Lwt.return (Error e)
+                match Dns_udp_resolver.answer ~sw ~net ~mono ~clock buf dns_udp_resolver with
+                | Error e -> Error e
                 | Ok buf ->
                   (* We need to parse and re-marshal so we can set the TC bit and truncate *)
                   begin match Dns.Protocol.Server.parse buf with
-                  | None ->
-                    Lwt.return (Error (`Msg "Failed to unmarshal DNS response from upstream"))
-                  | Some { answers; _ } ->
-                    Lwt.return (Ok (marshal_reply answers))
+                  | None -> Error (`Msg "Failed to unmarshal DNS response from upstream")
+                  | Some { answers; _ } -> Ok (marshal_reply answers)
                   end
               end
             | _, Host ->
-              D.resolve question
-              >>= function
+              match D.resolve net question with
               | [] ->
-                Lwt.return (Ok (Some (marshal nxdomain)))
+                Ok (Some (marshal nxdomain))
               | answers ->
-                Lwt.return (Ok (marshal_reply answers))
+                Ok (marshal_reply answers)
       end
     | _ ->
-      Lwt.return (Error (`Msg "DNS packet had multiple questions"))
+      Error (`Msg "DNS packet had multiple questions")
 
   let describe buf =
     let len = Cstruct.length buf in
@@ -461,14 +455,11 @@ struct
     | Some request -> Dns.Packet.to_string request
 
   let handle_udp ~t ~udp ~src ~dst:_ ~src_port buf =
-    answer t false buf
-    >>= function
+    match answer ~sw:t.sw ~net:t.net ~mono:t.mono ~clock:t.clock t false buf with
     | Error (`Msg m) ->
-      Log.warn (fun f -> f "%s lookup failed: %s" (describe buf) m);
-      Lwt.return (Ok ())
+      Log.warn (fun f -> f "%s lookup failed: %s" (describe buf) m)
     | Ok None ->
-      Log.err (fun f -> f "%s unable to marshal response" (describe buf));
-      Lwt.return (Ok ())
+      Log.err (fun f -> f "%s unable to marshal response" (describe buf))
     | Ok (Some buffer) ->
       Udp.write ~src_port:53 (* ~src:dst *) ~dst:src ~dst_port:src_port udp buffer
 
@@ -477,36 +468,32 @@ struct
     let listeners _ =
       Log.debug (fun f -> f "DNS TCP handshake complete");
       let f flow =
-        let packets = Dns_tcp_framing.connect flow in
+        let packets = Dns_tcp_framing.connect (flow :> <Eio.Flow.two_way; Eio.Flow.close>) in
         let rec loop () =
-          Dns_tcp_framing.read packets >>= function
-          | Error _    -> Lwt.return_unit
+          match Dns_tcp_framing.read packets with
+          | Error _    -> ()
           | Ok request ->
             (* Perform queries in background threads *)
             let queries () =
-              answer t true request >>= function
+              match answer ~sw:t.sw ~net:t.net ~mono:t.mono ~clock:t.clock t true request with
               | Error (`Msg m) ->
-                Log.warn (fun f -> f "%s lookup failed: %s" (describe request) m);
-                Lwt.return_unit
+                Log.warn (fun f -> f "%s lookup failed: %s" (describe request) m)
               | Ok None ->
-                Log.err (fun f -> f "%s unable to marshal response to" (describe request));
-                Lwt.return_unit
+                Log.err (fun f -> f "%s unable to marshal response to" (describe request))
               | Ok (Some buffer) ->
-                Dns_tcp_framing.write packets buffer >>= function
+                match Dns_tcp_framing.write packets buffer with
                 | Error (`Msg m) ->
                   Log.warn (fun f ->
-                      f "%s failed to write response: %s" (describe buffer) m);
-                  Lwt.return_unit
-                | Ok () ->
-                  Lwt.return_unit
+                      f "%s failed to write response: %s" (describe buffer) m)
+                | Ok () -> ()
             in
-            Lwt.async queries;
+            Eio.Fiber.fork ~sw:t.sw queries;
             loop ()
         in
         loop ()
       in
       Some f
     in
-    Lwt.return listeners
+    listeners
 
 end

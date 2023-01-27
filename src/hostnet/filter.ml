@@ -1,5 +1,3 @@
-open Lwt.Infix
-
 let src =
   let src = Logs.Src.create "ppp" ~doc:"point-to-point network link" in
   Logs.Src.set_level src (Some Logs.Info);
@@ -35,7 +33,7 @@ module Make(Input: Sig.VMNET) = struct
   let disconnect t = Input.disconnect t.input
   let after_disconnect t = Input.after_disconnect t.input
 
-  let write t ~size fill = Input.write t.input ~size fill >|= lift_error
+  let write t ~size fill = Input.write t.input ~size fill |> lift_error
 
   let filter valid_subnets valid_sources next buf =
     match Ethernet.Packet.of_cstruct buf with
@@ -99,15 +97,14 @@ module Make(Input: Sig.VMNET) = struct
                 (String.concat ", "
                    (List.map Ipaddr.V4.to_string valid_sources))
             )
-        end;
-        Lwt.return ()
+        end
       end
     | _ -> next buf
 
-  let listen t ~header_size callback =
-    Input.listen t.input ~header_size (fun buf ->
+  let listen ~sw t ~header_size callback =
+    Input.listen ~sw t.input ~header_size (fun buf ->
       filter t.valid_subnets t.valid_sources callback buf
-    ) >|= lift_error
+    ) |> lift_error
 
   let add_listener t callback =
     Input.add_listener t.input @@ filter t.valid_subnets t.valid_sources callback

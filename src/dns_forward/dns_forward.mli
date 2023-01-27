@@ -88,7 +88,7 @@ module Framing : sig
     type t
     (** A connection which can read and write complete DNS messages *)
 
-    val connect : <Iflow.rw; Eio.Flow.two_way; Eio.Flow.close> -> t
+    val connect : <Eio.Flow.two_way; Eio.Flow.close> -> t
     (** Prepare to read and write complete DNS messages over the given flow *)
 
     val read : t -> request Error.t

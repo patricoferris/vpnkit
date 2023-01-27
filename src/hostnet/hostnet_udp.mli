@@ -13,29 +13,36 @@ type datagram = {
 }
 (** A UDP datagram *)
 
-type reply = Cstruct.t -> unit Lwt.t
+type reply = Cstruct.t -> unit
 
 module Make
-    (Sockets: Sig.SOCKETS)
-    (Clock: Mirage_clock.MCLOCK)
-    (Time: Mirage_time.S):
+    (Sockets: Sig.SOCKETS):
 sig
 
   type t
   (** A UDP NAT implementation *)
 
-  val create: ?max_idle_time:int64 -> ?preserve_remote_port:bool -> ?max_active_flows:int -> unit -> t
+  val create: 
+    ?max_idle_time:int64 ->
+    ?preserve_remote_port:bool ->
+    ?max_active_flows:int ->
+    sw:Eio.Switch.t ->
+    Eio.Net.t ->
+    Eio.Time.Mono.t ->
+    Eio.Time.clock ->
+    unit ->
+    t
   (** Create a UDP NAT implementation which will keep "NAT rules" alive until
       they become idle for the given [?max_idle_time] or until the number of
       flows hits [?max_active_flows] at which point the oldest will be expired.
       If [~preserve_remote_port] is set then reply traffic will come from the
       remote source port, otherwise it will come from the NAT port. *)
 
-  val set_send_reply: t:t -> send_reply:(datagram -> unit Lwt.t) -> unit
+  val set_send_reply: t:t -> send_reply:(datagram -> unit) -> unit
   (** Register a reply callback which will be used to send datagrams to the
       NAT client. *)
 
-  val input: t:t -> datagram:datagram -> ttl:int -> unit -> unit Lwt.t
+  val input: t:t -> datagram:datagram -> ttl:int -> unit -> unit
   (** Process an incoming datagram, forwarding it over the Sockets implementation
       and set up a listening rule to catch replies. *)
 

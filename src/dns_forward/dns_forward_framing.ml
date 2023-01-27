@@ -30,7 +30,7 @@ module Tcp = struct
 
   type request = Cstruct.t
   type response = Cstruct.t
-  type flow = <Iflow.rw; Flow.two_way; Flow.close>
+  type flow = <Flow.two_way; Flow.close>
   type t = { flow : flow; write_m : Eio.Mutex.t; read_m : Eio.Mutex.t }
 
   let connect flow =
@@ -75,7 +75,7 @@ module Udp = struct
 
   type request = Cstruct.t
   type response = Cstruct.t
-  type flow = <Iflow.rw; Flow.two_way; Flow.close>
+  type flow = <Flow.two_way; Flow.close>
   type t = flow
 
   let connect flow = flow

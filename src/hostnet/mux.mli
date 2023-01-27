@@ -14,7 +14,7 @@ module Make(Netif: Mirage_net.S) : sig
 
   *)
 
-  val connect: Netif.t -> (t, error) result Lwt.t
+  val connect: sw:Eio.Switch.t -> Netif.t -> (t, error) result
   (** Connect a multiplexer/demultiplexer and return a [t] which behaves like
       a V1.NETWORK representing the multiplexed end. *)
 

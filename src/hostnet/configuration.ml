@@ -145,8 +145,8 @@ module Parse = struct
     Log.err (fun f ->
         f "Failed to parse IPv4 address '%s', using default of %a: %s"
           x Ipaddr.V4.pp default m);
-    Lwt.return default
-  | Ok x -> Lwt.return x
+    default
+  | Ok x -> x
 
   let ipv4_list default x =
     let all =
@@ -167,18 +167,17 @@ module Parse = struct
     end else ok
 
   let int = function
-  | None -> Lwt.return None
-  | Some x -> Lwt.return (
+  | None -> None
+  | Some x ->
       try Some (int_of_string @@ String.trim x)
       with _ ->
         Log.err (fun f ->
             f "Failed to parse integer value: '%s'" x);
         None
-    )
 
   let resolver = function
-  | Some "host" -> Lwt.return `Host
-  | _ -> Lwt.return `Upstream
+  | Some "host" -> `Host
+  | _ -> `Upstream
 
   let dns txt =
     let open Dns_forward in

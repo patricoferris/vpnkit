@@ -11,12 +11,12 @@ module Make(Files: Sig.FILES): sig
 
   type watch
 
-  val watch: ?path:string -> unit -> (watch, [ `Msg of string ]) result Lwt.t
+  val watch: sw:Eio.Switch.t -> fs:Eio.Fs.dir Eio.Path.t -> ?path:string -> unit -> (watch, [ `Msg of string ]) result
   (** Start watching the hosts file, updating the [etc_hosts] binding in the
       background. The [?path] argument allows the location of the hosts file
       to be overriden. This blocks until the watch has been established. *)
 
-  val unwatch: watch -> unit Lwt.t
+  val unwatch: watch -> unit
   (** Stop watching the hosts file *)
 
 end

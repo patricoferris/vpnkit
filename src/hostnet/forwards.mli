@@ -33,9 +33,9 @@ module Stream : sig
   module Tcp : Sig.FLOW_CLIENT with type address = Ipaddr.t * int
 end
 
-module Test (Clock : Mirage_clock.MCLOCK) : sig
+module Test : sig
   type server
 
-  val start_forwarder : string -> server Lwt.t
-  val shutdown : server -> unit Lwt.t
+  val start_forwarder : sw:Eio.Switch.t -> net:Eio.Net.t -> mono:Eio.Time.Mono.t -> string -> server
+  val shutdown : server -> unit
 end

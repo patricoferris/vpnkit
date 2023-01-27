@@ -23,7 +23,6 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  *)
-open Lwt.Infix
 
 let src =
   let src = Logs.Src.create "arp" ~doc:"fixed ARP table" in
@@ -38,8 +37,6 @@ module Make (Ethif: Ethernet.S) = struct
 
   type macaddr = Macaddr.t
   type t = { ethif: Ethif.t; mutable table: macaddr Table.t }
-  type error = [ `Timeout ]
-  let pp_error ppf `Timeout = Fmt.string ppf "Timeout"
 
   let to_string t =
     let pp_one (ip, mac) =
@@ -57,39 +54,34 @@ module Make (Ethif: Ethernet.S) = struct
     let mac = Ethif.mac t.ethif in
     Log.debug (fun f ->
         f "ARP: adding %s -> %s"
-          (Ipaddr.V4.to_string ip) (Macaddr.to_string mac));
-    Lwt.return_unit
+          (Ipaddr.V4.to_string ip) (Macaddr.to_string mac))
 
-  let set_ips t ips = Lwt_list.iter_s (add_ip t) ips
+  let set_ips t ips = List.iter (add_ip t) ips
 
   let remove_ip t ip =
     Log.debug (fun f -> f "ARP: removing %s" (Ipaddr.V4.to_string ip));
-    t.table <- Table.remove ip t.table;
-    Lwt.return_unit
+    t.table <- Table.remove ip t.table
 
   let query t ip =
     if Table.mem ip t.table
-    then Lwt.return (Ok (Table.find ip t.table))
+    then Table.find ip t.table
     else begin
       Log.warn (fun f ->
           f "ARP table has no entry for %s" (Ipaddr.V4.to_string ip));
-      Lwt.return (Error `Timeout)
+      raise Arp.Timeout
     end
 
   let output t pkt =
-    Ethif.write t.ethif ~src:pkt.Arp_packet.source_mac pkt.Arp_packet.target_mac `ARP
-      (fun buf ->
-        Arp_packet.encode_into pkt buf;
-        Arp_packet.size
-      )
+    let buf = Cstruct.create Arp_packet.size in
+    Arp_packet.encode_into pkt buf;
+    Ethif.writev t.ethif ~src:pkt.Arp_packet.source_mac pkt.Arp_packet.target_mac `ARP
+      [ buf ]
 
   let input t frame = match Arp_packet.decode frame with
   | Error err ->
-    Log.err (fun f -> f "error while reading ARP packet: %a" Arp_packet.pp_error err);
-    Lwt.return_unit
+    Log.err (fun f -> f "error while reading ARP packet: %a" Arp_packet.pp_error err)
   | Ok ({ Arp_packet.operation = Arp_packet.Reply; _ } as pkt) ->
-    Log.debug (fun f -> f "ARP ignoring reply %a" Arp_packet.pp pkt);
-    Lwt.return_unit
+    Log.debug (fun f -> f "ARP ignoring reply %a" Arp_packet.pp pkt)
   | Ok pkt ->
     if Table.mem pkt.target_ip t.table then begin
         Log.debug (fun f ->
@@ -101,12 +93,8 @@ module Make (Ethif: Ethernet.S) = struct
           source_ip = pkt.target_ip;
           target_ip = pkt.source_ip;
           target_mac = pkt.source_mac;
-        } >|= function
-        | Ok ()   -> ()
-        | Error e ->
-          Log.err (fun f ->
-              f "error while reading ARP packet: %a" Ethif.pp_error e);
-      end else Lwt.return_unit
+        }
+      end else ()
 
   type ethif = Ethif.t
 
@@ -118,5 +106,5 @@ module Make (Ethif: Ethernet.S) = struct
     in
     { table; ethif }
 
-  let disconnect _t = Lwt.return_unit
+  let disconnect _t = ()
 end

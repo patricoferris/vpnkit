@@ -1,4 +1,4 @@
-open Lwt.Infix
+open Eio
 
 let src =
   let src =
@@ -10,11 +10,7 @@ let src =
 module Log = (val Logs.src_log src : Logs.LOG)
 
 let log_exception_continue description f =
-  Lwt.catch
-    (fun () -> f ())
-    (fun e ->
-       Log.warn (fun f -> f "%s: caught %a" description Fmt.exn e);
-       Lwt.return ())
+  try f () with e -> Log.warn (fun f -> f "%s: caught %a" description Fmt.exn e)
 
 let allowed_addresses = ref None
 
@@ -26,7 +22,7 @@ let set_allowed_addresses ips =
   allowed_addresses := ips
 
 let errorf fmt = Fmt.kstr (fun e -> Error (`Msg e)) fmt
-let errorf' fmt = Fmt.kstr (fun e -> Lwt.return (Error (`Msg e))) fmt
+let errorf' fmt = Fmt.kstr (fun e -> Error (`Msg e)) fmt
 
 module Port = struct
   type t = Forwarder.Frame.Destination.t
@@ -58,7 +54,6 @@ module Port = struct
 end
 
 module Make
-    (Clock: Mirage_clock.MCLOCK)
     (Connector: Sig.Connector)
     (Socket: Sig.SOCKETS) =
 struct
@@ -88,7 +83,7 @@ udp:<local IP>:<local port>:udp:<remote IP>:<remote port>
 unix:<base64-encoded local path>:unix:<base64-encoded remote path>"
 
   let check_bind_allowed ip = match !allowed_addresses with
-  | None -> Lwt.return () (* no restriction *)
+  | None -> () (* no restriction *)
   | Some ips ->
     let match_ip allowed_ip =
       let exact_match = Ipaddr.compare allowed_ip ip = 0 in
@@ -99,107 +94,97 @@ unix:<base64-encoded local path>:unix:<base64-encoded remote path>"
       exact_match || wildcard
     in
     if List.fold_left (||) false (List.map match_ip ips)
-    then Lwt.return ()
-    else Lwt.fail (Unix.Unix_error(Unix.EPERM, "bind", ""))
+    then ()
+    else raise (Unix.Unix_error(Unix.EPERM, "bind", ""))
 
-  module Mux = Forwarder.Multiplexer.Make(Connector)
+  module Mux = Forwarder.Multiplexer
 
   (* Since we only need one connection to the port forwarding service,
      connect on demand and cache it. *)
-  let get_mux =
+  let get_mux ~sw =
     let mux = ref None in
-    let m = Lwt_mutex.create () in
+    let m = Eio.Mutex.create () in
     fun () ->
-      Lwt_mutex.with_lock m
+      Eio.Mutex.use_rw ~protect:false m
         (fun () ->
           (* If there is a multiplexer but it is broken, reconnect *)
           begin match !mux with
-          | None -> Lwt.return_unit
+          | None -> ()
           | Some m ->
             if not(Mux.is_running m) then begin
               Log.err (fun f -> f "Multiplexer has shutdown, reconnecting");
               mux := None;
               Mux.disconnect m
-            end else Lwt.return_unit
-          end >>= fun () ->
+            end else ()
+          end;
           match !mux with
           | None ->
-            Connector.connect ()
-            >>= fun remote ->
-            let mux' = Mux.connect remote "port-forwarding"
+            let remote = Connector.connect () in
+            let mux' = Mux.connect ~sw remote "port-forwarding"
               (fun flow destination ->
                 Log.err (fun f -> f "Unexpected connection from %s via port multiplexer" (Forwarder.Frame.Destination.to_string destination));
                 Mux.Channel.close flow
               ) in
             mux := Some mux';
-            Lwt.return mux'
-          | Some m -> Lwt.return m
+            mux'
+          | Some m -> m
         )
 
-  let open_channel destination =
-    get_mux ()
-    >>= fun mux ->
-    Mux.Channel.connect mux destination
+  let open_channel ~sw destination =
+    let mux = get_mux ~sw () in
+    let c = Mux.Channel.connect mux destination in
+    Eio.Switch.on_release sw (fun () -> Mux.Channel.close c);
+    c
 
-  let start_tcp_proxy description remote_port server =
-    let module Proxy = Mirage_flow_combinators.Proxy(Clock)(Mux.Channel)(Socket.Stream.Tcp) in
-    Socket.Stream.Tcp.listen server (fun local ->
-        open_channel remote_port
-        >>= fun remote ->
-        Lwt.finalize (fun () ->
-            Log.debug (fun f -> f "%s: connected" description);
-            Proxy.proxy remote local  >|= function
-            | Error e ->
-              Log.err (fun f ->
-                  f "%s proxy failed with %a" description Proxy.pp_error e)
-            | Ok (l_stats, r_stats) ->
-              Log.debug (fun f ->
-                  f "%s completed: l2r = %a; r2l = %a" description
-                    Mirage_flow.pp_stats l_stats
-                    Mirage_flow.pp_stats r_stats
-                )
-          ) (fun () ->
-            Mux.Channel.close remote
-          )
-      );
-    Lwt.return ()
+  let start_tcp_proxy ~sw ~net ~mono description remote_port server =
+    let module Proxy = Mirage_flow_combinators.Proxy in
+    Socket.Stream.Tcp.listen ~sw net server (fun local ->
+        Eio.Switch.run @@ fun sw ->
+        let remote = open_channel ~sw remote_port in
+        Log.debug (fun f -> f "%s: connected" description);
+        match Proxy.proxy ~mono (Mux.Channel.to_flow remote) (local :> <Eio.Flow.two_way; read : Cstruct.t>) with
+        | Error e ->
+          Log.err (fun f ->
+              f "%s proxy failed with %a" description Proxy.pp_error e)
+        | Ok (l_stats, r_stats) ->
+          Log.debug (fun f ->
+              f "%s completed: l2r = %a; r2l = %a" description
+                Mirage_flow.pp_stats l_stats
+                Mirage_flow.pp_stats r_stats
+            )
+      )
 
-  let start_unix_proxy description remote_port server =
-    let module Proxy = Mirage_flow_combinators.Proxy(Clock)(Mux.Channel)(Socket.Stream.Unix) in
-    Socket.Stream.Unix.listen server (fun local ->
-        open_channel remote_port
-        >>= fun remote ->
-        Lwt.finalize (fun () ->
-            Log.debug (fun f -> f "%s: connected" description);
-            Proxy.proxy remote local  >|= function
-            | Error e ->
-              Log.err (fun f ->
-                  f "%s proxy failed with %a" description Proxy.pp_error e)
-            | Ok (l_stats, r_stats) ->
-              Log.debug (fun f ->
-                  f "%s completed: l2r = %a; r2l = %a" description
-                    Mirage_flow.pp_stats l_stats
-                    Mirage_flow.pp_stats r_stats
-                )
-          ) (fun () ->
-            Mux.Channel.close remote
-          )
-      );
-    Lwt.return ()
+  let start_unix_proxy ~sw ~net ~mono description remote_port server =
+    let module Proxy = Mirage_flow_combinators.Proxy in
+    Socket.Stream.Unix.listen ~sw net server (fun local ->
+        Switch.run @@ fun sw ->
+        let remote = open_channel ~sw remote_port in
+        Log.debug (fun f -> f "%s: connected" description);
+        match Proxy.proxy ~mono (Mux.Channel.to_flow remote) (local :> <Flow.two_way; read : Cstruct.t>) with
+        | Error e ->
+          Log.err (fun f ->
+              f "%s proxy failed with %a" description Proxy.pp_error e)
+        | Ok (l_stats, r_stats) ->
+          Log.debug (fun f ->
+              f "%s completed: l2r = %a; r2l = %a" description
+                Mirage_flow.pp_stats l_stats
+                Mirage_flow.pp_stats r_stats
+            )
+      )
 
   let conn_read flow buf =
-    Mux.Channel.read_into flow buf >>= function
-    | Ok `Eof       -> Lwt.fail End_of_file
-    | Error e       -> Fmt.kstr Lwt.fail_with "%a" Mux.Channel.pp_error e
-    | Ok (`Data ()) -> Lwt.return ()
+    match Mux.Channel.read_into flow buf with
+    | Ok `Eof       -> raise End_of_file
+    | Error e       -> Fmt.kstr failwith "%a" Mux.Channel.pp_error e
+    | Ok (`Data ()) -> ()
 
   let conn_write flow buf =
-    Mux.Channel.write flow buf >>= function
-    | Error `Closed -> Lwt.fail End_of_file
-    | Error e       -> Fmt.kstr Lwt.fail_with "%a" Mux.Channel.pp_write_error e
-    | Ok ()         -> Lwt.return ()
+    match Mux.Channel.write flow buf with
+    | Error `Closed -> raise End_of_file
+    | Error e       -> Fmt.kstr failwith "%a" Mux.Channel.pp_write_error e
+    | Ok ()         -> ()
 
-  let start_udp_proxy description remote_port server =
+  let start_udp_proxy ~sw description remote_port server =
     let from_internet_buffer = Cstruct.create Constants.max_udp_length in
     (* We write to the internet using the from_vsock_buffer *)
     let from_vsock_buffer =
@@ -215,99 +200,94 @@ unix:<base64-encoded local path>:unix:<base64-encoded remote path>"
             payload_length = Cstruct.length buf;
         }) in
         let header = Forwarder.Frame.Udp.write_header udp write_header_buffer in
-        conn_write v header >>= fun () ->
+        conn_write v header;
         conn_write v buf
       in
       (* Read the vsock header and payload into the same buffer, and write it
          to the internet from there. *)
       let read v =
-        conn_read v (Cstruct.sub from_vsock_buffer 0 2) >>= fun () ->
+        conn_read v (Cstruct.sub from_vsock_buffer 0 2);
         let frame_length = Cstruct.LE.get_uint16 from_vsock_buffer 0 in
         if frame_length > (Cstruct.length from_vsock_buffer) then begin
           Log.err (fun f ->
               f "UDP encapsulated frame length is %d but buffer has length %d: \
                  dropping" frame_length (Cstruct.length from_vsock_buffer));
-          Lwt.return None
+          None
         end else begin
           let rest = Cstruct.sub from_vsock_buffer 2 (frame_length - 2) in
-          conn_read v rest >|= fun () ->
+          conn_read v rest;
           let udp, payload = Forwarder.Frame.Udp.read from_vsock_buffer in
           Some (payload, (udp.Forwarder.Frame.Udp.ip, udp.Forwarder.Frame.Udp.port))
         end
       in
       let rec from_internet v =
-        Lwt.catch (fun () ->
-            Socket.Datagram.Udp.recvfrom fd from_internet_buffer
-            >>= fun (len, address) ->
-            write v (Cstruct.sub from_internet_buffer 0 len) address
-            >>= fun () ->
-            Lwt.return true
-          ) (function
-          | Unix.Unix_error(Unix.EBADF, _, _) -> Lwt.return false
-          | e ->
-            Log.err (fun f ->
-                f "%s: shutting down recvfrom thread: %a" description Fmt.exn e);
-            Lwt.return false)
-        >>= function
+        let res =
+          try
+              let len, address = Socket.Datagram.Udp.recvfrom fd from_internet_buffer in
+              write v (Cstruct.sub from_internet_buffer 0 len) address;
+              true
+          with
+            | Unix.Unix_error(Unix.EBADF, _, _) -> false
+            | e ->
+              Log.err (fun f ->
+                  f "%s: shutting down recvfrom thread: %a" description Fmt.exn e);
+              false
+        in
+        match res with
         | true -> from_internet v
-        | false -> Lwt.return ()
+        | false -> ()
       in
       let rec from_vsock v =
-        Lwt.catch (fun () ->
-            read v >>= function
-            | None                -> Lwt.return false
+        let res =
+          try
+            match read v with
+            | None                -> false
             | Some (buf, address) ->
-              Socket.Datagram.Udp.sendto fd address buf >|= fun () ->
+              Socket.Datagram.Udp.sendto fd address buf;
               true
-          ) (fun e ->
+          with e ->
             Log.debug (fun f ->
                 f "%s: shutting down from vsock thread: %a"
                   description Fmt.exn e);
-            Lwt.return false
-          ) >>= function
+            false
+        in
+        match res with
         | true -> from_vsock v
-        | false -> Lwt.return ()
+        | false -> ()
       in
       Log.debug (fun f ->
           f "%s: connecting to vsock port %s" description
             (Port.to_string remote_port));
-
-      open_channel remote_port
-      >>= fun remote ->
-      Lwt.finalize (fun () ->
-          Log.debug (fun f ->
-              f "%s: connected to vsock port %s" description
-                (Port.to_string remote_port));
-          (* FIXME(samoht): why ignoring that thread here? *)
-          let _ = from_vsock remote in
-          from_internet remote
-        ) (fun () -> Mux.Channel.close remote)
+      Eio.Switch.run @@ fun sw ->
+      let remote = open_channel ~sw remote_port in
+      Log.debug (fun f ->
+          f "%s: connected to vsock port %s" description
+            (Port.to_string remote_port));
+      (* FIXME(samoht): why ignoring that thread here? *)
+      let _ = from_vsock remote in
+      from_internet remote
     in
-    Lwt.async (fun () ->
-        log_exception_continue "udp handle" (fun () -> handle server));
-    Lwt.return ()
+    Fiber.fork ~sw (fun () ->
+        log_exception_continue "udp handle" (fun () -> handle server))
 
-  let start t =
+  let start ~sw ~net ~mono t =
     match t.local with
-    | `Tcp (local_ip, local_port) ->
+    | `Tcp (local_ip, local_port) -> (
       let description =
         Fmt.str "forwarding from tcp:%a:%d" Ipaddr.pp local_ip local_port
       in
-      Lwt.catch (fun () ->
-          check_bind_allowed local_ip  >>= fun () ->
-          Socket.Stream.Tcp.bind ~description (local_ip, local_port)
-          >>= fun server ->
+      try
+          check_bind_allowed local_ip;
+          let server = Socket.Stream.Tcp.bind ~sw net ~description (local_ip, local_port) in
           t.server <- Some (`Tcp server);
           (* Resolve the local port yet (the fds are already bound) *)
-          Socket.Stream.Tcp.getsockname server
-          >>= fun (_, bound_port) ->
+          let _, bound_port = Socket.Stream.Tcp.getsockname server in
           t.local <- ( match t.local with
             | `Tcp (ip, 0) -> `Tcp (ip, bound_port)
             | _ -> t.local );
-          start_tcp_proxy (to_string t) t.remote_port server
-          >|= fun () ->
+          start_tcp_proxy ~sw ~net ~mono (to_string t) t.remote_port server;
           Ok t
-        ) (function
+      with
         | Unix.Unix_error(Unix.EADDRINUSE, _, _) ->
           errorf' "Bind for %a:%d failed: port is already allocated"
             Ipaddr.pp local_ip local_port
@@ -321,25 +301,22 @@ unix:<base64-encoded local path>:unix:<base64-encoded remote path>"
           errorf' "Bind for %a:%d: unexpected error %a" Ipaddr.pp local_ip
             local_port Fmt.exn e
         )
-    | `Udp (local_ip, local_port) ->
+    | `Udp (local_ip, local_port) -> (
       let description =
         Fmt.str "forwarding from udp:%a:%d" Ipaddr.pp local_ip local_port
       in
-      Lwt.catch (fun () ->
-          check_bind_allowed local_ip >>= fun () ->
-          Socket.Datagram.Udp.bind ~description (local_ip, local_port)
-          >>= fun server ->
+      try
+          check_bind_allowed local_ip;
+          let server = Socket.Datagram.Udp.bind ~sw net ~description (local_ip, local_port) in
           t.server <- Some (`Udp server);
           (* Resolve the local port yet (the fds are already bound) *)
-          Socket.Datagram.Udp.getsockname server
-          >>= fun (_, bound_port) ->
+          let _, bound_port = Socket.Datagram.Udp.getsockname server in
           t.local <- ( match t.local with
             | `Udp (ip, 0) -> `Udp (ip, bound_port)
             | _ -> t.local );
-          start_udp_proxy (to_string t) t.remote_port server
-          >|= fun () ->
+          start_udp_proxy ~sw (to_string t) t.remote_port server;
           Ok t
-        ) (function
+      with
         | Unix.Unix_error(Unix.EADDRINUSE, _, _) ->
           errorf' "Bind for %a:%d failed: port is already allocated"
             Ipaddr.pp local_ip local_port
@@ -357,14 +334,12 @@ unix:<base64-encoded local path>:unix:<base64-encoded remote path>"
       let description =
         Fmt.str "forwarding from unix:%s" path
       in
-      Lwt.catch (fun () ->
-          Socket.Stream.Unix.bind ~description path
-          >>= fun server ->
+      try
+          let server = Socket.Stream.Unix.bind ~sw net ~description path in
           t.server <- Some (`Unix server);
-          start_unix_proxy (to_string t) t.remote_port server
-          >|= fun () ->
+          start_unix_proxy ~sw ~net ~mono (to_string t) t.remote_port server;
           Ok t
-        ) (function
+      with
         | Unix.Unix_error(Unix.EADDRINUSE, _, _) ->
           errorf' "Bind for %s failed: port is already allocated" path
         | Unix.Unix_error(Unix.EADDRNOTAVAIL, _, _) ->
@@ -374,7 +349,6 @@ unix:<base64-encoded local path>:unix:<base64-encoded remote path>"
         | e ->
           errorf' "Bind for %s: unexpected error %a" path
             Fmt.exn e
-        )
 
   let stop t =
     Log.debug (fun f -> f "%s: closing listening socket" (to_string t));
@@ -382,7 +356,7 @@ unix:<base64-encoded local path>:unix:<base64-encoded remote path>"
     | Some (`Tcp s) -> Socket.Stream.Tcp.shutdown s
     | Some (`Udp s) -> Socket.Datagram.Udp.shutdown s
     | Some (`Unix s) -> Socket.Stream.Unix.shutdown s
-    | None -> Lwt.return_unit
+    | None -> ()
 
   let of_string x =
     match Stringext.split ~on:':' ~max:6 x with

@@ -89,7 +89,7 @@ module Client = struct
                 | Ok flow ->
                     Fun.protect
                       (fun () ->
-                        let rw = Packet.connect flow in
+                        let rw = Packet.connect (flow :> <Flow.two_way; Flow.close>) in
                         t.message_cb ~dst:t.address ~buf:buffer ();
 
                         (* An existing connection to the server might have been closed by the server;
@@ -235,7 +235,7 @@ module Client = struct
                     ( t.address.Dns_forward_config.Address.ip,
                       t.address.Dns_forward_config.Address.port )
                   >>= fun flow ->
-                  let rw = Packet.connect flow in
+                  let rw = Packet.connect (flow :> <Flow.two_way; Flow.close>) in
                   t.rw <- Some rw;
                   Fiber.fork ~sw (dispatcher t rw);
                   Ok rw
@@ -365,7 +365,7 @@ module Server = struct
 
     let listen ~sw { server; _ } cb =
       Sockets.listen ~sw server (fun flow ->
-          let rw = Packet.connect flow in
+          let rw = Packet.connect (flow :> <Flow.two_way; Flow.close>) in
           let rec loop () =
             Packet.read rw >>= fun request ->
             Fiber.fork ~sw (fun () ->

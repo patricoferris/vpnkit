@@ -1,5 +1,3 @@
-open Lwt.Infix
-
 let src =
   let src = Logs.Src.create "mux" ~doc:"Mirage TCP/IP <-> socket proxy" in
   Logs.Src.set_level src (Some Logs.Info);
@@ -31,7 +29,7 @@ module Make (Netif: Mirage_net.S) = struct
 
   module RuleMap = Map.Make(Ipaddr.V4)
 
-  type callback = Cstruct.t -> unit Lwt.t
+  type callback = Cstruct.t -> unit
 
   type port = {
     callback: callback;
@@ -83,22 +81,21 @@ module Make (Netif: Mirage_net.S) = struct
       Log.debug (fun f -> f "using default callback for non-IPv4 frame");
       t.default_callback buf
 
-  let connect netif =
+  let connect ~sw netif =
     let rules = RuleMap.empty in
-    let default_callback = fun _ -> Lwt.return_unit in
+    let default_callback = fun _ -> () in
     let t = { netif; rules; default_callback } in
-    Lwt.async
+    Eio.Fiber.fork ~sw
       (fun () ->
-         Netif.listen netif ~header_size:Ethernet.Packet.sizeof_ethernet @@ callback t >>= function
-         | Ok () -> Lwt.return_unit
+         match Netif.listen ~sw netif ~header_size:Ethernet.Packet.sizeof_ethernet @@ callback t with
+         | Ok () -> ()
          | Error _e ->
-           Log.err (fun f -> f "Mux.connect calling Netif.listen: failed");
-           Lwt.return_unit
+           Log.err (fun f -> f "Mux.connect calling Netif.listen: failed")
       );
-    Lwt.return (Ok t)
+    Ok t
 
-  let write t ~size fill = Netif.write t.netif ~size fill >|= lift_error
-  let listen t ~header_size:_ callback = t.default_callback <- callback; Lwt.return (Ok ())
+  let write t ~size fill = Netif.write t.netif ~size fill |> lift_error
+  let listen ~sw:_ t ~header_size:_ callback = t.default_callback <- callback; Ok ()
   let disconnect t = Netif.disconnect t.netif
   let mac t = Netif.mac t.netif
   let mtu t = Netif.mtu t.netif
@@ -113,21 +110,20 @@ module Make (Netif: Mirage_net.S) = struct
       rule: rule;
     }
 
-    let write t ~size fill = Netif.write t.netif ~size fill >|= lift_error
+    let write t ~size fill = Netif.write t.netif ~size fill |> lift_error
 
-    let listen t ~header_size:_ callback =
+    let listen ~sw:_ t ~header_size:_ callback =
       Log.debug (fun f ->
           f "activating switch port for %s" (Ipaddr.V4.to_string t.rule));
       let last_active_time = Unix.gettimeofday () in
       let port = { callback; last_active_time } in
       t.switch.rules <- RuleMap.add t.rule port t.switch.rules;
-      Lwt.return (Ok ())
+      Ok ()
 
     let disconnect t =
       Log.debug (fun f ->
           f "deactivating switch port for %s" (Ipaddr.V4.to_string t.rule));
-      t.switch.rules <- RuleMap.remove t.rule t.switch.rules;
-      Lwt.return_unit
+      t.switch.rules <- RuleMap.remove t.rule t.switch.rules
 
     let mac t = Netif.mac t.netif
     let mtu t = Netif.mtu t.netif

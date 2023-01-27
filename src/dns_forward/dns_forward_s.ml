@@ -149,7 +149,7 @@ module type READERWRITER = sig
   type response = Cstruct.t
   type t
 
-  val connect : <Iflow.rw; Eio.Flow.two_way; Eio.Flow.close> -> t
+  val connect : <Eio.Flow.two_way; Eio.Flow.close> -> t
   val read : t -> (request, [ `Msg of string ]) result
   val write : t -> response -> (unit, [ `Msg of string ]) result
   val close : t -> unit

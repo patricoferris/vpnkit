@@ -1,0 +1,3 @@
+(library
+ (name iflow)
+ (libraries eio))

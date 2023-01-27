@@ -1,3 +1,5 @@
+open Eio
+
 let src =
   let src =
     Logs.Src.create "forwards" ~doc:"Forwards TCP/UDP streams to local services"
@@ -79,91 +81,76 @@ let update xs =
 (* Extend a SHUTDOWNABLE flow with a `read_some` API, as used by "channel".
    Ideally we would use channel, but we need to access the underlying flow
    without leaving data trapped in the buffer. *)
-module type Read_some = sig
-  include Mirage_flow_combinators.SHUTDOWNABLE
 
-  val read_some :
-    flow -> int -> (Cstructs.t Mirage_flow.or_eof, error) result Lwt.t
+class virtual read_some = object (_ : <Iflow.rw; Flow.two_way; Flow.close; ..>)
+  inherit Iflow.rw
+  inherit Flow.two_way
+
+  method virtual read_some : int -> (Cstruct.t list, [`Msg of string]) result
 end
 
-module Read_some (FLOW : Mirage_flow_combinators.SHUTDOWNABLE) : sig
-  include Read_some
-
-  val connect : FLOW.flow -> flow
+module Read_some : sig
+  val read_some : #read_some -> int -> (Cstruct.t list, [`Msg of string]) result
+  val of_flow : <Iflow.rw; Flow.two_way; Flow.close> -> read_some
 end = struct
   (* A flow with a buffer, filled by "read_some" and then drained by "read" *)
-  type flow = { mutable remaining : Cstruct.t; flow : FLOW.flow }
 
-  let connect flow = { remaining = Cstruct.create 0; flow }
+  let read_some f = f#read_some
 
-  type error = FLOW.error
+  let of_flow (f : <Iflow.rw; Flow.two_way; Flow.close>) = object (self)
+    inherit Iflow.rw
+    method read_into = f#read_into
+    method shutdown = f#shutdown
+    method read = f#read
+    method copy = f#copy
+    method close = f#close
+    method read_methods = f#read_methods
 
-  let pp_error = FLOW.pp_error
-
-  type write_error = FLOW.write_error
-
-  let pp_write_error = FLOW.pp_write_error
-
-  let read_some flow len =
-    let open Lwt.Infix in
-    let rec loop acc len =
-      if Cstruct.length flow.remaining = 0 && len > 0 then
-        FLOW.read flow.flow >>= function
-        | Error e -> Lwt.return (Error e)
-        | Ok (`Data buf) ->
-            flow.remaining <- buf;
-            loop acc len
-        | Ok `Eof -> Lwt.return (Ok `Eof)
-      else if Cstruct.length flow.remaining < len then (
-        let take = flow.remaining in
-        flow.remaining <- Cstruct.create 0;
-        loop (take :: acc) (len - Cstruct.length take))
-      else
-        let take, leave = Cstruct.split flow.remaining len in
-        flow.remaining <- leave;
-        Lwt.return @@ Ok (`Data (List.rev (take :: acc)))
-    in
-    loop [] len
-
-  let read flow =
-    if Cstruct.length flow.remaining > 0 then (
-      let result = flow.remaining in
-      flow.remaining <- Cstruct.create 0;
-      Lwt.return @@ Ok (`Data result))
-    else FLOW.read flow.flow
-
-  let write flow = FLOW.write flow.flow
-  let writev flow = FLOW.writev flow.flow
-  let close flow = FLOW.close flow.flow
-  let shutdown_write flow = FLOW.shutdown_write flow.flow
-  let shutdown_read flow = FLOW.shutdown_read flow.flow
+    val mutable remaining = Cstruct.create 0
+    method read_some t =
+        let rec loop acc len =
+          if Cstruct.length remaining = 0 && len > 0 then
+            match Iflow.read f with
+            | buf ->
+              remaining <- buf;
+              loop acc len
+          else if Cstruct.length remaining < len then (
+            let take = remaining in
+            remaining <- Cstruct.create 0;
+            loop (take :: acc) (len - Cstruct.length take))
+          else
+            let take, leave = Cstruct.split remaining len in
+            remaining <- leave;
+            Ok (List.rev (take :: acc))
+        in
+        loop [] t
+  end
 end
 
-module Handshake (FLOW : Read_some) = struct
+module Handshake = struct
   (* A Message is a buffer prefixed with a uint16 length field. *)
   module Message = struct
-    open Lwt.Infix
 
     let pp_error ppf = function
-      | `Flow e -> FLOW.pp_error ppf e
+      | `Flow _ -> Fmt.string ppf "Flow error"
       | `Eof -> Fmt.string ppf "EOF while reading handshake"
 
     let read flow =
-      FLOW.read_some flow 2 >>= function
-      | Error e -> Lwt.return (Error (`Flow e))
-      | Ok `Eof -> Lwt.return (Error `Eof)
-      | Ok (`Data bufs) -> (
+      match Read_some.read_some flow 2 with
+      | Error e -> Error (`Flow e)
+      | exception End_of_file -> Error `Eof
+      | Ok bufs -> (
           let buf = Cstructs.to_cstruct bufs in
           let len = Cstruct.LE.get_uint16 buf 0 in
-          FLOW.read_some flow len >>= function
-          | Error e -> Lwt.return (Error (`Flow e))
-          | Ok `Eof -> Lwt.return (Error `Eof)
-          | Ok (`Data bufs) -> Lwt.return (Ok (Cstructs.to_cstruct bufs)))
+          match Read_some.read_some flow len with
+          | Error e -> Error (`Flow e)
+          | exception End_of_file -> Error `Eof
+          | Ok bufs -> Ok (Cstructs.to_cstruct bufs))
 
     let write flow t =
       let len = Cstruct.create 2 in
       Cstruct.LE.set_uint16 len 0 (Cstruct.length t);
-      FLOW.writev flow [ len; t ]
+      Flow.write flow [ len; t ]
   end
 
   module Request = struct
@@ -208,15 +195,13 @@ module Handshake (FLOW : Read_some) = struct
 
     let to_string t = Ezjsonm.to_string @@ to_json t
 
-    open Lwt.Infix
-
     let read flow =
-      Message.read flow >>= function
-      | Error (`Flow e) -> Lwt.return (Error (`Flow e))
-      | Error `Eof -> Lwt.return (Error `Eof)
+      match Message.read flow with
+      | Error (`Flow e) -> Error (`Flow e)
+      | Error `Eof -> Error `Eof
       | Ok buf ->
           let j = Ezjsonm.from_string @@ Cstruct.to_string buf in
-          Lwt.return (Ok (of_json j))
+          Ok (of_json j)
 
     let write flow t =
       Message.write flow @@ Cstruct.of_string @@ Ezjsonm.to_string @@ to_json t
@@ -235,15 +220,13 @@ module Handshake (FLOW : Read_some) = struct
       let open Ezjsonm in
       dict [ ("accepted", bool t.accepted) ]
 
-    open Lwt.Infix
-
     let read flow =
-      Message.read flow >>= function
-      | Error (`Flow e) -> Lwt.return (Error (`Flow e))
-      | Error `Eof -> Lwt.return (Error `Eof)
+      match Message.read flow with
+      | Error (`Flow e) -> Error (`Flow e)
+      | Error `Eof -> Error `Eof
       | Ok buf ->
           let j = Ezjsonm.from_string @@ Cstruct.to_string buf in
-          Lwt.return (Ok (of_json j))
+          Ok (of_json j)
 
     let write flow t =
       Message.write flow @@ Cstruct.of_string @@ Ezjsonm.to_string @@ to_json t
@@ -274,23 +257,23 @@ module Tcp = struct
 end
 
 module Unix = struct
-  module FLOW = Host.Sockets.Stream.Unix
-  module Remote = Read_some (FLOW)
-  module Handshake = Handshake (Remote)
+  (* module FLOW = Host.Sockets.Stream.Unix *)
+  module Sunix = Host.Sockets.Stream.Unix
+  module Remote = Read_some
+  module Handshake = Handshake
 
-  type flow = { flow : Remote.flow }
+  type flow = read_some
 
-  let connect ?read_buffer_size:_ (dst_ip, dst_port) =
-    let open Lwt.Infix in
+  let connect ~sw ~net ?read_buffer_size:_ (dst_ip, dst_port) =
     let path = Tcp.find (dst_ip, dst_port) in
     let req = Fmt.str "%a, %d -> %s" Ipaddr.pp dst_ip dst_port path in
     Log.info (fun f -> f "%s: connecting" req);
-    FLOW.connect path >>= function
-    | Error (`Msg m) -> Lwt.return (Error (`Msg m))
+    match Sunix.connect ~sw ~net path with
+    | Error (`Msg m) -> Error (`Msg m)
     | Ok flow -> (
         Log.info (fun f -> f "%s: writing handshake" req);
-        let remote = Remote.connect flow in
-        Handshake.Request.write remote
+        let remote = Remote.of_flow flow in
+        match Handshake.Request.write remote
           {
             Handshake.Request.protocol = `Tcp;
             src_ip = Ipaddr.V4 Ipaddr.V4.any;
@@ -298,48 +281,32 @@ module Unix = struct
             dst_ip;
             dst_port;
           }
-        >>= function
-        | Error e ->
+        with
+        | exception e ->
             Log.info (fun f ->
-                f "%s: %a, returning RST" req Remote.pp_write_error e);
-            Remote.close remote >>= fun () ->
-            Lwt.return
+                f "%s: %s, returning RST" req (Printexc.to_string e));
+            Flow.close remote;
               (Error
                  (`Msg
-                   (Fmt.str "writing handshake: %a" Remote.pp_write_error e)))
-        | Ok () -> (
+                   (Fmt.str "writing handshake: %s" (Printexc.to_string e))))
+        | () -> (
             Log.info (fun f -> f "%s: reading handshake" req);
-            Handshake.Response.read remote >>= function
+            match Handshake.Response.read remote with
             | Error e ->
                 Log.info (fun f ->
                     f "%s: %a, returning RST" req Handshake.Message.pp_error e);
-                Remote.close remote >>= fun () ->
-                Lwt.return
+                Flow.close remote;
                   (Error
                      (`Msg
                        (Fmt.str "reading handshake: %a"
                           Handshake.Message.pp_error e)))
             | Ok { Handshake.Response.accepted = false } ->
                 Log.info (fun f -> f "%s: request rejected" req);
-                Remote.close remote >>= fun () ->
-                Lwt.return (Error (`Msg "ECONNREFUSED"))
+                Flow.close remote;
+                Error (`Msg "ECONNREFUSED")
             | Ok { Handshake.Response.accepted = true } ->
                 Log.info (fun f -> f "%s: forwarding connection" req);
-                Lwt.return (Ok { flow = remote })))
-
-  type error = Remote.error
-
-  let pp_error = Remote.pp_error
-
-  type write_error = Remote.write_error
-
-  let pp_write_error = Remote.pp_write_error
-  let read flow = Remote.read flow.flow
-  let write flow = Remote.write flow.flow
-  let writev flow = Remote.writev flow.flow
-  let close flow = Remote.close flow.flow
-  let shutdown_write flow = Remote.shutdown_write flow.flow
-  let shutdown_read flow = Remote.shutdown_read flow.flow
+                Ok remote))
 end
 
 module Stream = struct
@@ -349,25 +316,25 @@ module Stream = struct
     module Direct = Host.Sockets.Stream.Tcp
     module Forwarded = Unix
 
-    type flow = [ `Direct of Direct.flow | `Forwarded of Forwarded.flow ]
+    (* type flow = [ `Direct of Direct.flow | `Forwarded of Forwarded.flow ] *)
 
-    open Lwt.Infix
-
-    let connect ?read_buffer_size:_ (ip, port) =
+    let connect ~sw ~net ?read_buffer_size:_ (ip, port) =
       if Tcp.mem (ip, port) then
-        Unix.connect (ip, port) >>= function
-        | Ok flow -> Lwt.return (Ok (`Forwarded flow))
-        | Error e -> Lwt.return (Error e)
+        match Unix.connect ~sw ~net (ip, port) with
+        | Ok flow -> Ok (flow :> <Eio.Flow.two_way; Eio.Flow.close; Iflow.r>)
+        | Error e -> Error e
       else
-        Direct.connect (ip, port) >>= function
-        | Ok flow -> Lwt.return (Ok (`Direct flow))
-        | Error e -> Lwt.return (Error e)
+        match Direct.connect ~sw ~net (ip, port) with
+        | Ok flow -> Ok flow
+        | Error e -> Error e
 
-    type error = [ `Direct of Direct.error | `Forwarded of Forwarded.error ]
+    type error = [ `Direct of Direct.error ]
 
     let pp_error ppf = function
       | `Direct err -> Direct.pp_error ppf err
-      | `Forwarded err -> Forwarded.pp_error ppf err
+      (* | `Forwarded err -> Forwarded.pp_error ppf err *)
+
+    (*
 
     type write_error =
       [ `Closed
@@ -380,14 +347,14 @@ module Stream = struct
       | `Forwarded err -> Forwarded.pp_write_error ppf err
 
     let wrap_direct_error t =
-      t >>= function
-      | Ok x -> Lwt.return (Ok x)
-      | Error err -> Lwt.return (Error (`Direct err))
+      match t with
+      | Ok x -> Ok x
+      | Error err -> Error (`Direct err)
 
     let wrap_forwarded_error t =
-      t >>= function
-      | Ok x -> Lwt.return (Ok x)
-      | Error err -> Lwt.return (Error (`Forwarded err))
+      match t with
+      | Ok x -> Ok x
+      | Error err -> Error (`Forwarded err)
 
     let read = function
       | `Direct flow -> wrap_direct_error @@ Direct.read flow
@@ -414,74 +381,100 @@ module Stream = struct
     let shutdown_read = function
       | `Direct flow -> Direct.shutdown_read flow
       | `Forwarded flow -> Forwarded.shutdown_read flow
+  *)
   end
 end
 
-module Test (Clock : Mirage_clock.MCLOCK) = struct
-  module Remote = Read_some (Host.Sockets.Stream.Unix)
+module Proxy = struct
+  let proxy a b =
+    let open Eio in
+    Switch.run @@ fun sw ->
+    let a2b =
+      Fiber.fork_promise ~sw @@ fun () ->
+      try
+        Flow.copy a b;
+        Flow.shutdown a `Receive;
+        Flow.shutdown b `Send;
+        Ok ()
+      with exn -> Error (Printexc.to_string exn)
+    in
+    let b2a =
+      Fiber.fork_promise ~sw @@ fun () ->
+      try
+        Flow.copy b a;
+        Flow.shutdown b `Receive;
+        Flow.shutdown a `Send;
+        Ok ()
+      with exn -> Error (Printexc.to_string exn)
+    in
+    let a_stats = Eio.Promise.await_exn a2b in
+    let b_stats = Eio.Promise.await_exn b2a in
+    match a_stats, b_stats with
+    | Ok a_stats, Ok b_stats -> Ok ()
+    | Error e1  , Error e2   -> Error (`A_and_B (e1, e2))
+    | Error e1  ,  _         -> Error (`A e1)
+    | _         , Error e2   -> Error (`B e2)
 
+    let pp_error ppf = function
+    | `A_and_B (e1, e2) ->
+      Fmt.pf ppf "flow proxy a: %s; flow proxy b: %s" e1 e2
+    | `A e -> Fmt.pf ppf "flow proxy a: %s" e
+    | `B e -> Fmt.pf ppf "flow proxy b: %s" e
+end
+
+module Test = struct
+  module Remote = Host.Sockets.Stream.Unix
+(*
   module Proxy =
-    Mirage_flow_combinators.Proxy (Clock) (Remote) (Host.Sockets.Stream.Tcp)
-
-  module Handshake = Handshake (Remote)
-  open Lwt.Infix
+    Mirage_flow_combinators.Proxy (Remote) (Host.Sockets.Stream.Tcp) *)
 
   type server = Host.Sockets.Stream.Unix.server
 
-  let start_forwarder path =
-    Host.Sockets.Stream.Unix.bind path >>= fun s ->
-    Host.Sockets.Stream.Unix.listen s (fun flow ->
+  let start_forwarder ~sw ~net ~mono path =
+    let s = Host.Sockets.Stream.Unix.bind ~sw net path in
+    Host.Sockets.Stream.Unix.listen ~sw net s (fun flow ->
         Log.info (fun f -> f "accepted flow");
-        let local = Remote.connect flow in
-        Handshake.Request.read local >>= function
+        let local = Read_some.of_flow flow in
+        match Handshake.Request.read local with
         | Error e ->
             Log.info (fun f ->
-                f "reading handshake request %a" Handshake.Message.pp_error e);
-            Lwt.return_unit
+                f "reading handshake request %a" Handshake.Message.pp_error e)
         | Ok h -> (
             let req = Handshake.Request.to_string h in
             Log.info (fun f -> f "%s: connecting" req);
-            Host.Sockets.Stream.Tcp.connect
-              (h.Handshake.Request.dst_ip, h.Handshake.Request.dst_port)
-            >>= function
+            match Host.Sockets.Stream.Tcp.connect ~sw ~net
+              (h.Handshake.Request.dst_ip, h.Handshake.Request.dst_port) with
             | Error (`Msg m) -> (
                 Log.info (fun f -> f "%s: %s" req m);
-                Handshake.Response.write local
-                  { Handshake.Response.accepted = false }
-                >>= function
-                | Error e ->
+                match Handshake.Response.write local
+                  { Handshake.Response.accepted = false } with
+                | exception e ->
                     Log.info (fun f ->
-                        f "%s: writing handshake response %a" req
-                          Remote.pp_write_error e);
-                    Lwt.return_unit
-                | Ok () ->
-                    Log.info (fun f -> f "%s: returned handshake response" req);
-                    Lwt.return_unit)
+                        f "%s: writing handshake response %s" req (Printexc.to_string e))
+                | () ->
+                    Log.info (fun f -> f "%s: returned handshake response" req)
+            )
             | Ok remote ->
                 Log.info (fun f -> f "%s: connected" req);
-                Lwt.finalize
+                Fun.protect
                   (fun () ->
-                    Handshake.Response.write local
-                      { Handshake.Response.accepted = true }
-                    >>= function
-                    | Error e ->
+                    match Handshake.Response.write local
+                      { Handshake.Response.accepted = true } with
+                    | exception e ->
                         Log.info (fun f ->
-                            f "%s: writing handshake response %a" req
-                              Remote.pp_write_error e);
-                        Lwt.return_unit
-                    | Ok () -> (
+                            f "%s: writing handshake response %s" req (Printexc.to_string e))
+                    | () -> (
                         Log.info (fun f -> f "%s: proxying data" req);
-                        Proxy.proxy local remote >>= function
+                        match Proxy.proxy local remote with
                         | Error e ->
                             Log.info (fun f ->
                                 f "%s: TCP proxy failed with %a" req
-                                  Proxy.pp_error e);
-                            Lwt.return_unit
-                        | Ok (_l_stats, _r_stats) -> Lwt.return_unit))
-                  (fun () ->
+                                  Proxy.pp_error e)
+                        | Ok () -> ()))
+                  ~finally:(fun () ->
                     Log.info (fun f -> f "%s: disconnecting from remote" req);
-                    Host.Sockets.Stream.Tcp.close remote)));
-    Lwt.return s
+                    Flow.close remote)));
+    s
 
   let shutdown = Host.Sockets.Stream.Unix.shutdown
 end

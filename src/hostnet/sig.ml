@@ -1,19 +1,23 @@
+open Eio
 module type READ_INTO = sig
-  type flow
   type error
 
-  val read_into: flow -> Cstruct.t ->
-    (unit Mirage_flow.or_eof, error) result Lwt.t
+  val read_into: Flow.two_way -> Cstruct.t ->
+    (unit Mirage_flow.or_eof, error) result
     (** Completely fills the given buffer with data from [fd] *)
 end
 
 module type FLOW_CLIENT = sig
-  include Mirage_flow_combinators.SHUTDOWNABLE
+  (* include Mirage_flow_combinators.SHUTDOWNABLE *)
+
+  type error
+
+  val pp_error : Format.formatter -> error -> unit
 
   type address
 
-  val connect: ?read_buffer_size:int -> address ->
-    (flow, [`Msg of string]) result Lwt.t
+  val connect: sw:Eio.Switch.t -> net:Eio.Net.t -> ?read_buffer_size:int -> address ->
+    (<Iflow.rw; Eio.Flow.two_way; Eio.Flow.close>, [`Msg of string]) result
     (** [connect address] creates a connection to [address] and returns
         he connected flow. *)
 end
@@ -22,8 +26,7 @@ module type CONN = sig
   include Mirage_flow.S
 
   include READ_INTO
-    with type flow := flow
-     and type error := error
+    with type error := error
 end
 
 module type FLOW_SERVER = sig
@@ -32,14 +35,14 @@ module type FLOW_SERVER = sig
 
   type address
 
-  val of_bound_fd: ?read_buffer_size:int -> Unix.file_descr -> server Lwt.t
+  val of_bound_fd: sw:Eio.Switch.t -> ?read_buffer_size:int -> Unix.file_descr -> server
   (** Create a server from a file descriptor bound to a Unix domain socket
       by some other process and passed to us. *)
 
-  val bind: ?description:string -> address -> server Lwt.t
+  val bind: sw:Eio.Switch.t -> Eio.Net.t -> ?description:string -> address -> server
   (** Bind a server to an address *)
 
-  val getsockname: server -> address Lwt.t
+  val getsockname: server -> address
   (** Query the address the server is bound to *)
 
   val disable_connection_tracking: server -> unit
@@ -47,13 +50,13 @@ module type FLOW_SERVER = sig
       This is intended for internal purposes only (e.g. extracting diagnostics
       information) *)
 
-  type flow
+  (* type flow *)
 
-  val listen: server -> (flow -> unit Lwt.t) -> unit
+  val listen: sw:Eio.Switch.t -> Eio.Net.t -> server -> (<Iflow.rw; Eio.Flow.two_way; Eio.Flow.close> -> unit) -> unit
   (** Accept connections forever, calling the callback with each one.
       Connections are closed automatically when the callback finishes. *)
 
-  val shutdown: server -> unit Lwt.t
+  val shutdown: server -> unit
   (** Stop accepting connections on the given server *)
 end
 
@@ -61,7 +64,6 @@ module type FLOW_CLIENT_SERVER = sig
   include FLOW_CLIENT
   include FLOW_SERVER
     with type address := address
-    and type flow := flow
 end
 
 module type SOCKETS = sig
@@ -77,9 +79,9 @@ module type SOCKETS = sig
       include FLOW_CLIENT_SERVER
         with type address := address
 
-      val recvfrom: server -> Cstruct.t -> (int * address) Lwt.t
+      val recvfrom: server -> Cstruct.t -> (int * address)
 
-      val sendto: server -> address -> ?ttl:int -> Cstruct.t -> unit Lwt.t
+      val sendto: server -> address -> ?ttl:int -> Cstruct.t -> unit
     end
   end
   module Stream: sig
@@ -90,8 +92,7 @@ module type SOCKETS = sig
         with type address := address
 
       include READ_INTO
-        with type flow := flow
-         and type error := error
+        with type error := error
     end
 
     module Unix: sig
@@ -101,10 +102,9 @@ module type SOCKETS = sig
         with type address := address
 
       include READ_INTO
-        with type flow := flow
-         and type error := error
+        with type error := error
 
-      val unsafe_get_raw_fd: flow -> Unix.file_descr
+      val unsafe_get_raw_fd: <Eio.Flow.two_way; Eio.Flow.close> -> Unix.file_descr
       (** Return the underlying fd. This is intended for careful integration
           with 3rd party libraries. Don't use this fd at the same time as the
           flow. *)
@@ -116,21 +116,21 @@ end
 module type FILES = sig
   (** An OS-based file reading implementation *)
 
-  val read_file: string -> (string, [`Msg of string]) result Lwt.t
+  val read_file: #Eio.Fs.dir Eio.Path.t -> string
   (** Read a whole file into a string *)
 
   type watch
 
-  val watch_file: string -> (unit -> unit) -> (watch, [ `Msg of string ]) result Lwt.t
+  val watch_file: Eio.Fs.dir Eio.Path.t -> (unit -> unit) -> (watch, [ `Msg of string ]) result
   (** [watch_file path callback] executes [callback] whenever the contents of
       [path] may have changed. This blocks until the watch has been established. *)
 
-  val unwatch: watch -> unit Lwt.t
+  val unwatch: watch -> unit
   (** [unwatch watch] stops watching the path(s) associated with [watch] *)
 end
 
 module type DNS = sig
-  val resolve: Dns.Packet.question -> Dns.Packet.rr list Lwt.t
+  val resolve: Eio.Net.t -> Dns.Packet.question -> Dns.Packet.rr list
   (** Given a question, find associated resource records *)
 end
 
@@ -146,32 +146,8 @@ module type HOST = sig
     include FILES
   end
 
-  module Time: Mirage_time.S
-
   module Dns: sig
     include DNS
-  end
-
-  module Main: sig
-    val run: unit Lwt.t -> unit
-    (** Run the main event loop *)
-
-    val run_in_main: (unit -> 'a Lwt.t) -> 'a
-    (** Run the function in the main thread *)
-  end
-
-  module Fn: sig
-    (** Call a blocking ('a -> 'b) function in a ('a -> 'b Lwt.t) context *)
-
-    type ('request, 'response) t
-    (** A function from 'request to 'response *)
-
-    val create: ('request -> 'response) -> ('request, 'response) t
-    val destroy: ('request, 'response) t -> unit
-
-    val fn: ('request, 'response) t -> 'request -> 'response Lwt.t
-    (** Apply the function *)
-
   end
 end
 
@@ -180,23 +156,23 @@ module type VMNET = sig
 
   include Mirage_net.S
 
-  val add_listener: t -> (Cstruct.t -> unit Lwt.t) -> unit
+  val add_listener: t -> (Cstruct.t -> unit) -> unit
   (** Add a callback which will be invoked in parallel with all received packets *)
 
-  val after_disconnect: t -> unit Lwt.t
+  val after_disconnect: t -> unit Eio.Promise.t
   (** Waits until the network has disconnected *)
 
   type fd
 
   val of_fd:
-    connect_client_fn:(Uuidm.t -> Ipaddr.V4.t option -> (Macaddr.t, [`Msg of string]) result Lwt.t) ->
+    connect_client_fn:(Uuidm.t -> Ipaddr.V4.t option -> (Macaddr.t, [`Msg of string]) result) ->
     server_macaddr:Macaddr.t ->
     mtu:int ->
-    fd -> (t, [`Msg of string]) result Lwt.t
+    fd -> (t, [`Msg of string]) result
 
-  val start_capture: t -> ?size_limit:int64 -> string -> unit Lwt.t
+  val start_capture: t -> ?size_limit:int64 -> string -> unit
 
-  val stop_capture: t -> unit Lwt.t
+  val stop_capture: t -> unit
 
   val get_client_uuid: t -> Uuidm.t
 
@@ -218,6 +194,8 @@ module type DNS_POLICY = sig
       completely overrides lower priority configuration.  *)
 
   type priority = int (** higher is more important *)
+
+  val start : sw:Eio.Switch.t -> Eio.Fs.dir Eio.Path.t -> unit
 
   val add: priority:priority ->
     config:[ `Upstream of Dns_forward.Config.t | `Host ] -> unit
@@ -246,10 +224,9 @@ module type Connector = sig
 
   include FLOW_CLIENT
 
-  val connect: unit -> flow Lwt.t
+  val connect: unit -> Flow.two_way
   (** Connect to the port multiplexing service in the VM *)
 
   include READ_INTO
-    with type flow := flow
-     and type error := error
+    with type error := error
 end

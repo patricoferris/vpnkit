@@ -16,18 +16,25 @@ module Make
     (Tcp: Tcpip.Tcp.S with type ipaddr = Ipaddr.V4.t)
     (Socket: Sig.SOCKETS)
     (Dns_resolver: Sig.DNS)
-    (Time: Mirage_time.S)
-    (Clock: Mirage_clock.MCLOCK)
     (Recorder: Sig.RECORDER) :
 sig
 
   type t
   (** A DNS proxy instance with a fixed configuration *)
 
+  type 'a env = <
+    net : Eio.Net.t;             (** To connect to the servers *)
+    mono : Eio.Time.Mono.t;
+    clock : Eio.Time.clock;      (** Needed for timeouts *)
+    ..
+  > as 'a
+
   val create:
+    sw: Eio.Switch.t ->
     local_address:Dns_forward.Config.Address.t ->
     builtin_names:(Dns.Name.t * Ipaddr.t) list ->
-    Config.t -> t Lwt.t
+    _ env ->
+    Config.t -> t
   (** Create a DNS forwarding instance based on the given
       configuration, either [`Upstream config]: send DNS requests to
       the given upstream servers [`Host]: use the Host's resolver.
@@ -38,9 +45,10 @@ sig
 
   val handle_udp:
     t:t -> udp:Udp.t -> src:Ipaddr.V4.t -> dst:Ipaddr.V4.t -> src_port:int ->
-    Cstruct.t -> (unit, Udp.error) result Lwt.t
+    Cstruct.t -> unit
 
-  val handle_tcp: t:t -> (int -> (Tcp.flow -> unit Lwt.t) option) Lwt.t
+  val handle_tcp:
+    t:t -> (int -> (<Eio.Flow.two_way; Eio.Flow.close; Tcp.dst> -> unit) option)
 
-  val destroy: t -> unit Lwt.t
+  val destroy: t -> unit
 end

@@ -15,26 +15,24 @@ type datagram = {
 }
 (** An ICMP datagram *)
 
-type reply = Cstruct.t -> unit Lwt.t
+type reply = Cstruct.t -> unit
 
 module Make
     (Sockets: Sig.SOCKETS)
-    (Clock: Mirage_clock.MCLOCK)
-    (Time: Mirage_time.S)
 : sig
 
   type t
   (** An ICMP NAT implementation *)
 
-  val create: ?max_idle_time:int64 -> unit -> t Lwt.t
+  val create: sw:Eio.Switch.t -> mono:Eio.Time.Mono.t -> ?max_idle_time:int64 -> unit -> t
   (** Create an ICMP NAT implementation which will keep "NAT rules" alive until
       they become idle for the given [?max_idle_time] *)
 
-  val set_send_reply: t:t -> send_reply:(src:address -> dst:address -> payload:Cstruct.t -> unit Lwt.t) -> unit
+  val set_send_reply: t:t -> send_reply:(src:address -> dst:address -> payload:Cstruct.t -> unit) -> unit
   (** Register a reply callback which will be used to send datagrams to the
       NAT client. *)
 
-  val input: t:t -> datagram:datagram -> ttl:int -> unit -> unit Lwt.t
+  val input: t:t -> datagram:datagram -> ttl:int -> unit -> unit
   (** Process an incoming datagram, forwarding it over the Sockets implementation
       and set up a listening rule to catch replies. *)
 

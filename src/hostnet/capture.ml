@@ -1,5 +1,3 @@
-open Lwt.Infix
-
 let src =
   let src = Logs.Src.create "capture" ~doc:"capture network traffic" in
   Logs.Src.set_level src (Some Logs.Info);
@@ -34,7 +32,7 @@ module Make(Input: Sig.VMNET) = struct
     snaplen: int;
     limit: int;
     packets: packet Queue.t;
-    packets_c: unit Lwt_condition.t;
+    packets_c: Eio.Condition.t;
     mutable nr_bytes: int;
   }
 
@@ -54,7 +52,7 @@ module Make(Input: Sig.VMNET) = struct
     incr next_packet_id;
     let packet = { id; len; orig_len; time; bufs } in
     Queue.push packet rule.packets;
-    Lwt_condition.broadcast rule.packets_c ();
+    Eio.Condition.broadcast rule.packets_c;
     rule.nr_bytes <- rule.nr_bytes + len;
     while rule.nr_bytes > rule.limit do
       let to_drop = Queue.pop rule.packets in
@@ -85,7 +83,7 @@ module Make(Input: Sig.VMNET) = struct
   let to_pcap rule =
     let file_header_buf = Cstruct.create Pcap.LE.sizeof_pcap_header in
     write_file_header file_header_buf rule;
-    let header = Lwt_stream.of_list [ [ file_header_buf ] ] in
+    let header = [ file_header_buf ] in
     let last_seen_packet_id = ref (initial_packet_id - 1) in
     let body () =
       let rec wait () =
@@ -97,20 +95,18 @@ module Make(Input: Sig.VMNET) = struct
               else acc
             ) [] rule.packets |> List.rev in
         if new_packets = [] then begin
-          Lwt_condition.wait rule.packets_c
-          >>= fun () ->
+          Eio.Condition.await_no_mutex rule.packets_c;
           wait ()
-        end else Lwt.return new_packets in
-      wait ()
-      >>= fun new_packets ->
+        end else new_packets in
+      let new_packets = wait () in
       (* We could note the number of dropped packets here *)
       last_seen_packet_id := List.fold_left max !last_seen_packet_id (List.map (fun p -> p.id) new_packets);
       let marshalled_packets = List.map (fun p ->
           let header = frame_header (Cstruct.create Pcap.sizeof_pcap_packet) p in
           header :: p.bufs
       ) new_packets in
-      Lwt.return (Some (List.concat marshalled_packets)) in
-    Lwt_stream.(append header (from body))
+      (Some (List.concat marshalled_packets)) in
+    Seq.cons header (Seq.of_dispenser body)
 
   let pcap rule =
     let stat () =
@@ -191,7 +187,7 @@ module Make(Input: Sig.VMNET) = struct
 
   let add_match ~t ~name ~limit ~snaplen ~predicate =
     let packets = Queue.create () in
-    let packets_c = Lwt_condition.create () in
+    let packets_c = Eio.Condition.create () in
     let nr_bytes = 0 in
     let rule = { predicate; limit; snaplen; packets; packets_c; nr_bytes } in
     Hashtbl.replace t.rules name rule;
@@ -238,13 +234,13 @@ module Make(Input: Sig.VMNET) = struct
       let n = fill buf in
       record t [ Cstruct.sub buf 0 n ];
       n
-    ) >|= lift_error
+    ) |> lift_error
 
-  let listen t ~header_size callback =
-    Input.listen t.input ~header_size (fun buf ->
+  let listen ~sw t ~header_size callback =
+    Input.listen ~sw t.input ~header_size (fun buf ->
         record t [ buf ];
         callback buf
-    ) >|= lift_error
+    ) |> lift_error
 
   let add_listener t callback = Input.add_listener t.input callback
 

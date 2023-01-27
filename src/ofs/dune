@@ -1,5 +1,5 @@
 (library
  (name ofs)
  (libraries protocol-9p cstruct unix io-page logs astring mirage-time
-   mirage-flow duration)
+   mirage-flow duration eio)
  (wrapped false))

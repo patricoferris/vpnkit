@@ -1,4 +1,4 @@
-open Lwt.Infix
+open Eio
 
 let src =
   let src = Logs.Src.create "ICMP" ~doc:"ICMP NAT implementation" in
@@ -7,7 +7,7 @@ let src =
 
 module Log = (val Logs.src_log src : Logs.LOG)
 
-type reply = Cstruct.t -> unit Lwt.t
+type reply = Cstruct.t -> unit
 
 type address = Ipaddr.V4.t
 
@@ -23,8 +23,6 @@ type datagram = {
 
 module Make
     (Sockets: Sig.SOCKETS)
-    (Clock: Mirage_clock.MCLOCK)
-    (Time: Mirage_time.S)
 = struct
 
   module Icmp = Sockets.Datagram.Udp
@@ -42,19 +40,23 @@ module Make
   module IntSet = Set.Make(struct type t = int let compare = compare end)
 
   type t = {
+    sw : Eio.Switch.t;
+    mono : Eio.Time.Mono.t;
     server_fd: Unix.file_descr;
     server: Icmp.server;
     phys_to_flow: (key, flow) Hashtbl.t;
     virt_to_flow: (key, flow) Hashtbl.t;
     ids_in_use: IntSet.t ref;
     mutable next_id: int;
-    mutable send_reply: (src:address -> dst:address -> payload:Cstruct.t -> unit Lwt.t) option;
+    mutable send_reply: (src:address -> dst:address -> payload:Cstruct.t -> unit) option;
   }
 
-  let start_background_gc phys_to_flow virt_to_flow ids_in_use max_idle_time =
+  let ns_to_s ns = Int64.to_float ns /. 1_000_000_000.
+
+  let start_background_gc ~sw ~mono ~clock phys_to_flow virt_to_flow ids_in_use max_idle_time =
     let rec loop () =
-      Time.sleep_ns max_idle_time >>= fun () ->
-      let now_ns = Clock.elapsed_ns () in
+      Time.sleep clock (ns_to_s max_idle_time);
+      let now_ns = Time.Mono.now mono |> Mtime.to_uint64_ns in
       let to_shutdown =
         Hashtbl.fold (fun phys flow acc ->
             if Int64.(sub now_ns flow.last_use) > max_idle_time then begin
@@ -99,36 +101,33 @@ module Make
   let ipproto_icmp = 1 (* according to BSD /etc/protocols *)
   let _port = 0 (* port isn't meaningful in this context *)
 
-  let create ?(max_idle_time = Duration.(of_sec 60)) () =
+  let create ~sw ~mono ?(max_idle_time = Duration.(of_sec 60)) () =
     let phys_to_flow = Hashtbl.create 7 in
     let virt_to_flow = Hashtbl.create 7 in
-    (try Lwt.return @@ Unix.socket Unix.PF_INET sock_icmp ipproto_icmp with e -> Lwt.fail e)
-    >>= fun server_fd ->
-    Icmp.of_bound_fd server_fd
-    >>= fun server ->
+    let server_fd = Unix.socket Unix.PF_INET sock_icmp ipproto_icmp in
+    let server = Icmp.of_bound_fd ~sw server_fd in
     let ids_in_use = ref IntSet.empty in
     let next_id = 0 in
     let send_reply = None in
     let _background_gc_t = start_background_gc phys_to_flow virt_to_flow ids_in_use max_idle_time in
-    Lwt.return { server; server_fd; phys_to_flow; virt_to_flow; ids_in_use; next_id; send_reply }
+    { server; sw; mono; server_fd; phys_to_flow; virt_to_flow; ids_in_use; next_id; send_reply }
 
-  let start_receiver t =
+  let start_receiver ~sw t =
     let buf = Cstruct.create 4096 in
 
     let try_to_send ~src ~dst ~payload =
       match t.send_reply with
       | Some fn ->
-        fn ~src ~dst ~payload
-        >>= fun () ->
-        Lwt.return true
+        fn ~src ~dst ~payload;
+        true
       | None ->
         Log.warn (fun f -> f "dropping ICMP because reply callback not set");
-        Lwt.return true in
+        true in
 
     let rec loop () =
-      Lwt.catch (fun () ->
-        Icmp.recvfrom t.server buf
-        >>= fun (n, _) ->
+      let v =
+        try
+        let (n, _) = Icmp.recvfrom t.server buf in
         let datagram = Cstruct.sub buf 0 n in
         (* On macOS the IP length field is set to a very large value (16384) which
            probably reflects some kernel datastructure size rather than the real
@@ -139,7 +138,7 @@ module Make
         match Frame.ipv4 [ datagram ] with
         | Error (`Msg m) ->
           Log.err (fun f -> f "Error unmarshalling IP datagram: %s" m);
-          Lwt.return_true
+          true
         | Ok { src; payload = Frame.Icmp { raw; icmp = Frame.Echo { id; _ }; _ }; _ } ->
           if Hashtbl.mem t.phys_to_flow (src, id) then begin
             let flow = Hashtbl.find t.phys_to_flow (src, id) in
@@ -153,7 +152,7 @@ module Make
             Log.debug (fun f ->
               f "ICMP dropping (%a, %d) %a"
               Ipaddr.V4.pp src id Cstruct.hexdump_pp raw);
-            Lwt.return_true
+            true
           end
         | Ok { src=src'; dst=dst'; payload = Frame.Icmp { raw = icmp_buffer; icmp = Frame.Time_exceeded { ipv4 = Ok { src; dst; raw = original_ipv4; payload = Frame.Icmp { raw = original_icmp; icmp = Frame.Echo { id; _ }; _ }; _ }; _ }; _ }; _ } ->
           (* This message comes from a router. We need to examine the nested packet to see
@@ -181,7 +180,7 @@ module Make
               Ipaddr.V4.pp dst
               id
             );
-            Lwt.return_true
+            true
           end
         | Ok { src=src'; dst=dst'; payload = Frame.Icmp { raw = icmp_buffer; icmp = Frame.Time_exceeded { ipv4 = Ok { src; dst; raw = original_ipv4; payload = Frame.Udp { raw = original_udp; src = src_port; dst = dst_port; _ }; _ }; _ }; _ }; _ }
         | Ok { src=src'; dst=dst'; payload = Frame.Icmp { raw = icmp_buffer; icmp = Frame.Destination_unreachable { ipv4 = Ok { src; dst; raw = original_ipv4; payload = Frame.Udp { raw = original_udp; src = src_port; dst = dst_port; _ }; _ }; _ }; _ }; _ } ->
@@ -198,7 +197,7 @@ module Make
               try_to_send ~src:src' ~dst:internal_src ~payload:icmp_buffer
             | _, _ ->
               Log.debug (fun f -> f "Dropping TTL exceeded from internal IPv6 address");
-              Lwt.return_true
+              true
           end else begin
             Log.debug (fun f -> f "Dropping TTL exceeded src' = %a dst' = %a; src = %a:%d; dst = %a:%d"
               Ipaddr.V4.pp src'
@@ -206,40 +205,40 @@ module Make
               Ipaddr.V4.pp src src_port
               Ipaddr.V4.pp dst dst_port
             );
-            Lwt.return_true
+            true
           end
         | Ok { payload = Frame.Icmp { icmp = Frame.Time_exceeded { ipv4 = Error (`Msg m) }; _ }; _ } ->
           Log.err (fun f -> f "Failed to forward TTL exceeeded: failed to parse inner packet: %s" m);
-          Lwt.return_true
+          true
         | Ok { payload = Frame.Icmp { icmp = Frame.Time_exceeded { ipv4 = Ok { src; dst; payload = Frame.Tcp { src = src_port; dst = dst_port; _ }; _ }; _ }; _ }; _ } ->
           (* TODO: implement for TCP *)
           Log.debug (fun f -> f "Dropping TTL exceeeded for TCP %a:%d -> %a%d"
             Ipaddr.V4.pp src src_port Ipaddr.V4.pp dst dst_port
           );
-          Lwt.return_true
+          true
         | Ok { payload = Frame.Icmp { icmp = Frame.Time_exceeded _; _ }; _ } ->
           Log.debug (fun f -> f "Dropping TTL exceeded for non-ICMP/UDP/TCP");
-          Lwt.return_true
+          true
         | Ok { payload = Frame.Icmp { icmp = Frame.Unknown_icmp { ty } ; _ }; _ } ->
           Log.err (fun f -> f "Failed to forward unexpected ICMP datagram with type %d" ty);
-          Lwt.return_true
+          true
         | Ok _ ->
           Log.debug (fun f -> f "Failed to forward unexpected IPv4 datagram");
-          Lwt.return_true
-      ) (fun e ->
+          true
+        with e ->
         Log.err (fun f ->
             f "Hostnet_icmp: caught unexpected exception %a"
               Fmt.exn e);
-        Lwt.return false
-      ) >>= function
-      | false ->
-        Lwt.return_unit
+        false
+      in
+      match v with
+      | false -> ()
       | true -> loop () in
-    Lwt.async loop
+    Fiber.fork ~sw loop
 
   let set_send_reply ~t ~send_reply =
     t.send_reply <- Some send_reply;
-    start_receiver t
+    start_receiver ~sw:t.sw t
 
   let input ~t ~datagram:{src; dst; ty; code; id; seq; payload} ~ttl () =
     Log.debug (fun f ->
@@ -248,8 +247,7 @@ module Make
         ttl ty code id seq (Cstruct.length payload));
     match Icmpv4_wire.int_to_ty ty with
       | None ->
-        Log.err (fun f -> f "Unknown ICMP type: %d" ty);
-        Lwt.return_unit
+        Log.err (fun f -> f "Unknown ICMP type: %d" ty)
       | Some ty ->
         let virt = src, id in
         let id =
@@ -259,13 +257,12 @@ module Make
           end else allocate_next_id t in
         begin match id with
           | None ->
-            Log.warn (fun f -> f "Dropping ICMP because we've run out of external ids");
-            Lwt.return_unit
+            Log.warn (fun f -> f "Dropping ICMP because we've run out of external ids")
           | Some id' ->
             let phys = dst, id' in
             let description = Printf.sprintf "%s id=%d -> %s id=%d"
               (Ipaddr.V4.to_string @@ fst virt) (snd virt) (Ipaddr.V4.to_string @@ fst phys) (snd phys) in
-            let last_use = Clock.elapsed_ns () in
+            let last_use = Time.Mono.now t.mono |> Mtime.to_uint64_ns in
             let flow = { description; virt; phys; last_use } in
             Hashtbl.replace t.phys_to_flow phys flow;
             Hashtbl.replace t.virt_to_flow virt flow;

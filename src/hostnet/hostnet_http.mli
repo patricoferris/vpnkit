@@ -13,7 +13,7 @@ end
 module Make
     (Ip: Tcpip.Ip.S with type ipaddr = Ipaddr.V4.t)
     (Udp: Tcpip.Udp.S with type ipaddr = Ipaddr.V4.t)
-    (Tcp: Mirage_flow_combinators.SHUTDOWNABLE)
+    (Tcp: Tcpip.Tcp.S with type ipaddr = Ipaddr.V4.t)
     (Remote: Sig.FLOW_CLIENT with type address = Ipaddr.t * int)
     (Dns_resolver: Sig.DNS) :
 sig
@@ -27,32 +27,36 @@ sig
     -> ?transparent_http_ports:int list -> ?transparent_https_ports:int list
     -> ?allow_enabled:bool -> ?allow:string list -> ?allow_error_msg:string
     -> unit ->
-    (t, [`Msg of string]) result Lwt.t
+    (t, [`Msg of string]) result
   (** Create a transparent HTTP forwarding instance which forwards
       HTTP to the proxy [http], HTTPS to the proxy [https] or connects
       directly if the URL matches [exclude].
       If an allow list is provided then host names not on the list will
       be rejected. *)
 
-  val of_json: Ezjsonm.value -> (t, [`Msg of string]) result Lwt.t
+  val of_json: Ezjsonm.value -> (t, [`Msg of string]) result
   (** [of_json json] decodes [json] into a proxy configuration *)
 
   val to_json: t -> Ezjsonm.t
   (** [to_json t] encodes [t] into json *)
 
   val transparent_proxy_handler:
+    sw:Eio.Switch.t ->
+    net:Eio.Net.t ->
     localhost_names:Dns.Name.t list ->
     localhost_ips:Ipaddr.t list ->
     dst:(Ipaddr.V4.t * int) -> t:t ->
-    (int -> (Tcp.flow -> unit Lwt.t) option) Lwt.t option
+    (int -> (<Eio.Flow.two_way; Eio.Flow.close; Tcp.dst> -> unit) option) option
   (** Intercept outgoing HTTP flows and redirect to the upstream proxy
       if one is defined. *)
 
   val explicit_proxy_handler:
+    sw:Eio.Switch.t ->
+    net:Eio.Net.t ->
     localhost_names:Dns.Name.t list ->
     localhost_ips:Ipaddr.t list ->
     dst:(Ipaddr.V4.t * int) -> t:t ->
-    (int -> (Tcp.flow -> unit Lwt.t) option) Lwt.t option
+    (int -> (<Eio.Flow.two_way; Eio.Flow.close; Tcp.dst> -> unit) option) option
   (** Intercept outgoing HTTP proxy flows and if an upstream proxy is
       defined, redirect to it, otherwise implement the proxy function
       ourselves. *)

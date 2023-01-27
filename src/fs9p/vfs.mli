@@ -23,9 +23,9 @@ module Error : sig
   (** Infix operators. *)
   module Infix : sig
     val ( >>*= ) :
-      ('a, t) result Lwt.t ->
-      ('a -> ('b, t) result Lwt.t) ->
-      ('b, t) result Lwt.t
+      ('a, t) result ->
+      ('a -> ('b, t) result) ->
+      ('b, t) result
   end
 
   val no_entry : ('a, t) result
@@ -57,7 +57,7 @@ module Error : sig
   val pp : t Fmt.t
 end
 
-type 'a or_err = ('a, Error.t) result Lwt.t
+type 'a or_err = ('a, Error.t) result
 (** The type of errors. *)
 
 val ok : 'a -> 'a or_err
@@ -132,7 +132,7 @@ module File : sig
         [init] and a function which can be called to get the current
         contents. *)
 
-  val status : ?length:(unit -> int Lwt.t) -> (unit -> string Lwt.t) -> t
+  val status : ?length:(unit -> int) -> (unit -> string) -> t
   (** [status f] is the file containing the result of [f]. [f] is
       evaluated everytime the file is open. If [length] is not set,
       [f] will also be called during [stat] queries.*)
@@ -192,7 +192,7 @@ module File : sig
         -- is broadcasted to all the current readers of the stream. *)
   end
 
-  val of_stream : (unit -> Stream.t Lwt.t) -> t
+  val of_stream : (unit -> Stream.t) -> t
   (** [of_stream s] is the file which will be, once opened, similar to
     the stream [s ()]. *)
 

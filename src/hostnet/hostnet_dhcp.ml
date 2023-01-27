@@ -1,4 +1,4 @@
-open Lwt.Infix
+open Eio
 
 let src =
   let src = Logs.Src.create "dhcp" ~doc:"Mirage TCP/IP" in
@@ -13,9 +13,10 @@ let global_dhcp_configuration = ref None
 let update_global_configuration x =
     global_dhcp_configuration := x
 
-module Make (Clock: Mirage_clock.MCLOCK) (Netif: Mirage_net.S) = struct
+module Make (Netif: Mirage_net.S) = struct
 
   type t = {
+    mono : Eio.Time.Mono.t;
     netif: Netif.t;
     server_macaddr: Macaddr.t;
     get_dhcp_configuration: unit -> Dhcp_server.Config.t;
@@ -39,7 +40,7 @@ module Make (Clock: Mirage_clock.MCLOCK) (Netif: Mirage_net.S) = struct
   let very_long_lease = Int32.max_int (* over 68 years *)
 
   (* given some MACs and IPs, construct a usable DHCP configuration *)
-  let make ~configuration:c netif =
+  let make ~mono ~configuration:c netif =
     let open Dhcp_server.Config in
     let low_ip =
       let open Ipaddr.V4 in
@@ -93,7 +94,7 @@ module Make (Clock: Mirage_clock.MCLOCK) (Netif: Mirage_net.S) = struct
         range = Some (c.Configuration.lowest_ip, c.Configuration.lowest_ip); (* allow one dynamic client *)
       } in
 
-    { server_macaddr = c.Configuration.server_macaddr; get_dhcp_configuration; netif }
+    { mono; server_macaddr = c.Configuration.server_macaddr; get_dhcp_configuration; netif }
 
   let of_interest mac dest =
     Macaddr.compare dest mac = 0 || not (Macaddr.is_unicast dest)
@@ -103,29 +104,29 @@ module Make (Clock: Mirage_clock.MCLOCK) (Netif: Mirage_net.S) = struct
   let logged_bootrequest = ref false
   let logged_bootreply = ref false
 
-  let input net (config : Dhcp_server.Config.t) database buf =
+  let input ~mono net (config : Dhcp_server.Config.t) database buf =
     let open Dhcp_server in
     match Dhcp_wire.pkt_of_buf buf (Cstruct.length buf) with
     | Error e ->
       Log.err (fun f -> f "failed to parse DHCP packet: %s" e);
-      Lwt.return database
+      database
     | Ok pkt ->
       let elapsed_seconds =
-        Clock.elapsed_ns ()
-        |> Duration.to_sec
-        |> Int32.of_int
+        Time.Mono.now mono
+        |> Mtime.to_uint64_ns
+        |> Int64.to_int32
       in
       match Input.input_pkt config database pkt elapsed_seconds with
-      | Input.Silence -> Lwt.return database
+      | Input.Silence -> database
       | Input.Update database ->
         Log.debug (fun f -> f "lease database updated");
-        Lwt.return database
+        database
       | Input.Warning w ->
         Log.warn (fun f -> f "%s" w);
-        Lwt.return database
+        database
       | Input.Error e ->
         Log.err (fun f -> f "%s" e);
-        Lwt.return database
+        database
       | Input.Reply (reply, database) ->
         let open Dhcp_wire in
         if pkt.op <> Dhcp_wire.BOOTREQUEST || not !logged_bootrequest
@@ -136,10 +137,10 @@ module Make (Clock: Mirage_clock.MCLOCK) (Netif: Mirage_net.S) = struct
           !logged_bootrequest || (pkt.op = Dhcp_wire.BOOTREQUEST);
         Netif.write net ~size:1500 (fun buf ->
           Dhcp_wire.pkt_into_buf reply buf
-        ) >>= function
+        ) |> function
         | Error e ->
           Log.err (fun f -> f "failed to parse DHCP reply: %a" Netif.pp_error e);
-          Lwt.return database
+          database
         | Ok () ->
           let domain = List.fold_left (fun acc x -> match x with
             | Domain_name y -> y
@@ -159,7 +160,7 @@ module Make (Clock: Mirage_clock.MCLOCK) (Netif: Mirage_net.S) = struct
             );
           logged_bootreply :=
             !logged_bootreply || (reply.op = Dhcp_wire.BOOTREPLY);
-          Lwt.return database
+          database
 
   let callback t buf =
     (* TODO: the scope of this reference ensures that the database
@@ -174,12 +175,11 @@ module Make (Clock: Mirage_clock.MCLOCK) (Netif: Mirage_net.S) = struct
       (match pkt.Ethernet.Packet.ethertype with
       | `IPv4 ->
         if Dhcp_wire.is_dhcp buf (Cstruct.length buf) then begin
-          input t.netif (t.get_dhcp_configuration ()) !database buf
-          >|= fun db ->
+          let db = input ~mono:t.mono t.netif (t.get_dhcp_configuration ()) !database buf in
           database := db
         end
         else
-          Lwt.return_unit
-      | _ -> Lwt.return_unit)
-    | _ -> Lwt.return_unit
+          ()
+      | _ -> ())
+    | _ -> ()
 end

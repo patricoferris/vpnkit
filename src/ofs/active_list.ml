@@ -1,5 +1,3 @@
-open Lwt.Infix
-
 let src =
   let src = Logs.Src.create "ofs" ~doc:"active_list" in
   Logs.Src.set_level src (Some Logs.Info);
@@ -11,21 +9,21 @@ module Var = struct
 
   type 'a t = {
     mutable thing: 'a option;
-    c: unit Lwt_condition.t;
+    c: Eio.Condition.t;
   }
 
   let create () =
-    let c = Lwt_condition.create () in
+    let c = Eio.Condition.create () in
     { thing = None; c }
 
   let fill t thing =
     t.thing <- Some thing;
-    Lwt_condition.broadcast t.c ()
+    Eio.Condition.broadcast t.c
 
   let read t =
     let rec loop () = match t.thing with
-    | Some c -> Lwt.return c
-    | None   -> Lwt_condition.wait t.c >>= loop
+    | Some c -> c
+    | None   -> Eio.Condition.await_no_mutex t.c; loop ()
     in
     loop ()
 
@@ -38,9 +36,9 @@ module type Instance = sig
 
   val description_of_format: string
 
-  val start: t -> (t, [ `Msg of string ]) result Lwt.t
+  val start: sw:Eio.Switch.t -> net:Eio.Net.t -> mono:Eio.Time.Mono.t -> t -> (t, [ `Msg of string ]) result
 
-  val stop: t -> unit Lwt.t
+  val stop: t -> unit
 
   type key
   val get_key: t -> key
@@ -87,9 +85,9 @@ module Make (Instance: Instance) = struct
   }
 
   module Error = struct
-    let badfid = Lwt.return (Response.error "fid not found")
-    let enoent = Lwt.return (Response.error "file not found")
-    let eperm  = Lwt.return (Response.error "permission denied")
+    let badfid = Response.error "fid not found"
+    let enoent = Response.error "file not found"
+    let eperm  = Response.error "permission denied"
   end
 
   let qid_path = ref 0_L
@@ -126,7 +124,7 @@ Immediately read the file contents and check whether it says:
 The directory will be deleted and replaced with a file of the same name.
 |} Instance.description_of_format)
 
-  let return x = Lwt.return (Ok x)
+  let return x = Ok x
 
   let attach connection ~cancel:_ { Request.Attach.fid; _ } =
     connection.fids := Types.Fid.Map.add fid Root !(connection.fids);
@@ -169,24 +167,18 @@ The directory will be deleted and replaced with a file of the same name.
   let free_resource = function
   | ControlFile entry ->
     Log.debug (fun f -> f "freeing entry %s" entry.name);
-    let open Lwt.Infix in
     ( match entry.instance with
-    | None -> Lwt.return ()
-    | Some f -> Instance.stop f )
-    >>= fun () ->
+    | None -> ()
+    | Some f -> Instance.stop f );
     entry.instance <- None;
-    active := StringMap.remove entry.name !active;
-    Lwt.return ()
-  | _ ->
-    Lwt.return ()
+    active := StringMap.remove entry.name !active
+  | _ -> ()
 
   let clunk connection ~cancel:_ { Request.Clunk.fid } =
-    let open Lwt.Infix in
     ( if Types.Fid.Map.mem fid !(connection.fids) then begin
           let resource = Types.Fid.Map.find fid !(connection.fids) in
           free_resource resource
-        end else Lwt.return () )
-    >>= fun () ->
+        end else ());
     connection.fids := Types.Fid.Map.remove fid !(connection.fids);
     return ()
 
@@ -223,18 +215,15 @@ The directory will be deleted and replaced with a file of the same name.
     let rec write off rest = function
     | [] -> return off
     | stat :: xs ->
-      let open Infix in
       let n = Types.Stat.sizeof stat in
       if off < offset
       then write (off + n) rest xs
       else if Cstruct.length rest < n then return off
       else
-        Lwt.return (Types.Stat.write stat rest)
-        >>*= fun rest ->
-        write (off + n) rest xs in
-    let open Lwt.Infix in
-    write 0 buf children
-    >>= function
+        Result.bind (Types.Stat.write stat rest)
+        (fun rest -> write (off + n) rest xs)
+    in
+    match write 0 buf children with
     | Ok offset' ->
       let data = Cstruct.sub buf 0 (max 0 (offset' - offset)) in
       return { Response.Read.data }
@@ -319,7 +308,7 @@ The directory will be deleted and replaced with a file of the same name.
                   (string_of_resource resource));
       Error.eperm
 
-  let write connection ~cancel:_ { Request.Write.fid; offset; data } =
+  let write ~sw ~net ~mono connection ~cancel:_ { Request.Write.fid; offset; data } =
     Log.debug (fun f ->
         f "Write offset=%Ld data=[%s] to file" offset (Cstruct.to_string data));
     let ok = { Response.Write.count = Int32.of_int @@ Cstruct.length data } in
@@ -333,15 +322,13 @@ The directory will be deleted and replaced with a file of the same name.
           Error.eperm
         end else begin match Instance.of_string @@ Cstruct.to_string data with
         | Ok f ->
-          let open Lwt.Infix in
-          begin Instance.start f >>=
-            function
+          begin match Instance.start ~sw ~net ~mono f with
             | Ok f' -> (* local_port is resolved *)
               entry.instance <- Some f';
               entry.result <- Some ("OK " ^ (Instance.to_string f') ^ "\n");
               Log.debug (fun f ->
                   f "Created instance %s" (Instance.to_string f'));
-              return ok
+              return ok 
             | Error (`Msg m) ->
               entry.result <- Some ("ERROR " ^ m ^ "\n");
               return ok

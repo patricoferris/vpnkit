@@ -13,7 +13,7 @@ module Make(Input: Sig.VMNET): sig
     predicate:(Frame.t -> bool) -> rule
   (** Start capturing traffic which matches a given rule *)
 
-  val to_pcap: rule -> (Cstruct.t list) Lwt_stream.t
+  val to_pcap: rule -> (Cstruct.t list) Seq.t
   (** Given a rule return a pcap formatted stream of packets matching the rule *)
 
   val filesystem: t -> Vfs.Dir.t
