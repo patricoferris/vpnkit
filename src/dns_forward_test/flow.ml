@@ -65,17 +65,17 @@ let otherend flow =
 let write flow buf =
   if flow.l2r_closed then Error `Closed else (
     ignore @@ Lwt_dllist.add_l buf flow.l2r;
-    Eio.Condition.signal flow.l2r_c;
+    Eio.Condition.broadcast flow.l2r_c;
     Ok ()
   )
 
 let shutdown_read flow =
   flow.r2l_closed <- true;
-  Eio.Condition.signal flow.r2l_c
+  Eio.Condition.broadcast flow.r2l_c
 
 let shutdown_write flow =
   flow.l2r_closed <- true;
-  Eio.Condition.signal flow.l2r_c
+  Eio.Condition.broadcast flow.l2r_c
 
 let nr_connects = Hashtbl.create 7
 
@@ -86,8 +86,8 @@ let close flow =
   if nr = 0 then Hashtbl.remove nr_connects flow.server_address else Hashtbl.replace nr_connects flow.server_address nr;
   flow.l2r_closed <- true;
   flow.r2l_closed <- true;
-  Eio.Condition.signal flow.l2r_c;
-  Eio.Condition.signal flow.r2l_c
+  Eio.Condition.broadcast flow.l2r_c;
+  Eio.Condition.broadcast flow.r2l_c
 
 type server = {
   mutable listen_cb: unit -> (flow, [ `Msg of string ]) result;

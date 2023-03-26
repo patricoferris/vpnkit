@@ -55,7 +55,8 @@ depends: [
   "mirage-time" {>= "3.0.0"}
   "mirage-channel" {>= "4.0.1"}
   "mirage-stack"
-  "cohttp-lwt" {>= "0.99.0"}
+  "http"
+  "cohttp-eio" {>= "0.99.0"}
   "protocol-9p" {>= "2.0.0"}
   "mirage-vnetif" {>= "0.5.0"}
   "io-page"       {>= "3.0.0"}
@@ -80,6 +81,16 @@ pin-depends:[
   # OCaml 5 fixes
   [ "fd-send-recv.dev" "git+https://github.com/xapi-project/ocaml-fd-send-recv#1c47d34726f30c2068b783a20c16da3ac707ea73" ]
   [ "hvsock.dev" "git+https://github.com/mirage/ocaml-hvsock#6b90ba4ab43257e05e377672f4e07b2d1b643588"]
+  # OCaml 5 things
+  [ "arp.dev" "git+https://github.com/patricoferris/arp#0e2df90cb6eca68c33e77bfe8c0552482c6218c9"]
+  [ "ethernet.dev" "git+https://github.com/patricoferris/ethernet#99ed193ee18a0bb1f27e1af55c9b3e45b60de5bb"]
+  [ "http.dev" "git+https://github.com/patricoferris/mirage-cohttp#e7712f3b48070fedcc4980725c7a51b576aa7ec3" ]
+  [ "cohttp-eio.dev" "git+https://github.com/patricoferris/mirage-cohttp#e7712f3b48070fedcc4980725c7a51b576aa7ec3" ]
+  [ "mirage-flow.dev" "git+https://github.com/patricoferris/mirage-flow#b81a3858c839f375d9ed4da66a55d0e8d4798bac"]
+  [ "mirage-channel.dev" "git+https://github.com/patricoferris/mirage-flow#d7e696f670ff123474bd4a05878ad67c8a3b614f"]
+  [ "mirage-net.dev" "git+https://github.com/patricoferris/mirage-net#75c5ec7060301211ccccbc8d36fb91a08fa36abd" ]
+  [ "mirage-vnetif.dev" "git+https://github.com/patricoferris/mirage-vnetif#f092eb6d8621c1441718e2cc6419f6841a1ad4bf" ]
+  [ "tcpip.dev" "git+https://github.com/patricoferris/mirage-tcpip#34d4761a05da6c49b9a63f714ebe2fb2dfcc7036" ]
 ]
 synopsis: "VPN-friendly networking devices for HyperKit"
 description: """
